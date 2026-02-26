@@ -30,15 +30,13 @@ class LitMambaJEPA(pl.LightningModule):
             lowdim['agl2_1'], lowdim['agl2_2'], lowdim['agl2_3'], lowdim['agl2_4'], lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']
         ], dim=1)
 
-        # Reshape to sequence [B=1, L=BatchSize, ...]
         rgb_seq = {cam: rgb[cam].unsqueeze(0) for cam in rgb} 
         lowdim_seq = concat_lowdim.unsqueeze(0) 
         
         loss = self.jepa(rgb_seq, lowdim_seq)
         
-        self.log("jepa_loss", loss, prog_bar=True)
+        self.log("jepa_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         
-        # Update EMA
         self.jepa.update_ema(self.total_steps, self.max_training_steps)
         self.total_steps += 1
         return loss
@@ -67,23 +65,21 @@ def main():
         'gripper_act':(16,1), 'gripper_act2':(16,1)
     }
     scaler = Scaler(lowdim_dict=lowdim_dict)
-    
-    # Correcting scaler path to root
-    scaler_path = '/home/jeonchanwook/MTIL/scaler_params.pth'
-    if not os.path.exists(scaler_path):
-        scaler_path = 'scaler_params.pth'
-    
-    scaler.load(scaler_path)
+    scaler.load('/home/jeonchanwook/MTIL/scaler_params.pth')
     train_dataset.scaler = scaler
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False, num_workers=8)
+    # 🧬 DataLoader: batch_size=32, shuffle=True (5%만 쓸 때는 섞는 것이 좋습니다)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=8)
     
     model = LitMambaJEPA(config, scaler)
     
+    # 🧬 Trainer settings for 5% data and 5 epochs
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=[0],
-        max_epochs=50,
+        max_epochs=5,               # 5 Epochs only
+        limit_train_batches=0.05,    # Use only 5% of training data
+        limit_val_batches=0.05,      # Use only 5% of validation data
         precision=32
     )
     
