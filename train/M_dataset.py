@@ -343,7 +343,7 @@ class MambaSequenceDataset(Dataset):
 
 
 def main():
-    root_dir = "insert_data200"  # 你自己的数据集目录
+    root_dir = "/home/jeonchanwook/MTIL/transfer.100"  # 你自己的数据集目录
     dataset = MambaSequenceDataset(root_dir=root_dir, mode="train", use_pose10d=True)
 
     # 计算归一化参数
