@@ -73,13 +73,17 @@ class MambaJEPA(nn.Module):
 
         # 3. Context Encoding (Only context part)
         context_repr_list = []
+        pred_actions_list = []
         h_context = self.context_model.init_hidden_states(B, device)
         for t in range(context_len):
             imgs_t = {cam: images[cam][:, t] for cam in self.context_model.camera_names}
-            _, h_context, hidden = self.context_model.step(lowdim[:, t], imgs_t, h_context, return_repr=True)
+            pred_act, h_context, hidden = self.context_model.step(lowdim[:, t], imgs_t, h_context, return_repr=True)
             context_repr_list.append(hidden.unsqueeze(1))
+            pred_actions_list.append(pred_act.unsqueeze(1))
         
         last_context_repr = context_repr_list[-1].squeeze(1) 
+        # For evaluation/logging, we might want the actions predicted during context
+        pred_actions = torch.cat(pred_actions_list, dim=1) # [B, context_len, future_steps, action_dim]
 
         # 4. Predictor: Predict future Target representations
         loss = 0
@@ -92,6 +96,6 @@ class MambaJEPA(nn.Module):
                 actual_repr = target_repr[:, t_future]
                 loss += F.mse_loss(predicted_repr, actual_repr)
             
-            return loss / num_targets
+            return loss / num_targets, pred_actions
         else:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            return torch.tensor(0.0, device=device, requires_grad=True), pred_actions
