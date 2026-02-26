@@ -3,7 +3,7 @@ import torch
 from torch import nn
 import numpy as np
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Sampler, BatchSampler
+from torch.utils.data import DataLoader, Sampler
 import torch.nn.functional as F
 from pytorch_lightning import seed_everything
 from train.metric_M import my_Metric
@@ -15,19 +15,16 @@ from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 class TrajectoryBatchSampler(Sampler):
-    """
-    데이터셋의 cum_lengths를 이용하여 궤적 단위로 인덱스를 묶어서 반환하는 샘플러.
-    이를 통해 DataLoader가 1회 호출될 때 하나의 전체 궤적을 반환하게 함.
-    """
     def __init__(self, cum_lengths, shuffle=False):
         self.cum_lengths = cum_lengths
         self.shuffle = shuffle
         self.traj_indices = list(range(len(cum_lengths) - 1))
 
     def __iter__(self):
+        indices = self.traj_indices
         if self.shuffle:
-            np.random.shuffle(self.traj_indices)
-        for i in self.traj_indices:
+            indices = np.random.permutation(self.traj_indices).tolist()
+        for i in indices:
             yield list(range(self.cum_lengths[i], self.cum_lengths[i+1]))
 
     def __len__(self):
@@ -44,32 +41,20 @@ class LitMambaJEPA(pl.LightningModule):
         self.lr = 1e-4
         self.weight_decay = 1e-4
         self.total_steps = 0
-        self.max_training_steps = 100000 
-
-        # Standard deviations for noise injection (from train.py)
-        self.std_agl_1 = 0.0036; self.std_agl_2 = 0.5280; self.std_agl_3 = 0.1980
-        self.std_agl_4 = 0.0164; self.std_agl_5 = 0.3592; self.std_agl_6 = 0.5998
-        self.std_agl2_1 = 0.1084; self.std_agl2_2 = 0.5019; self.std_agl2_3 = 0.4448
-        self.std_agl2_4 = 0.1414; self.std_agl2_5 = 0.3066; self.std_agl2_6 = 0.2251
-        self.std_grip1 = 0.2553; self.std_grip2 = 0.2475
+        self.max_training_steps = 5000 # Reduced for small dataset
 
     def _prepare_batch(self, batch):
-        # batch: DataLoader가 TrajectoryBatchSampler를 통해 묶어준 [L, ...] 형태의 데이터
         rgb = batch['rgb']
         lowdim = batch['lowdim']
         
-        # Noise injection (Sequence level)
+        # Noise injection
         noise_agl = 0.02
-        for key, std in [('agl_1', self.std_agl_1), ('agl_2', self.std_agl_2), ('agl_3', self.std_agl_3),
-                         ('agl_4', self.std_agl_4), ('agl_5', self.std_agl_5), ('agl_6', self.std_agl_6),
-                         ('agl2_1', self.std_agl2_1), ('agl2_2', self.std_agl2_2), ('agl2_3', self.std_agl2_3),
-                         ('agl2_4', self.std_agl2_4), ('agl2_5', self.std_agl2_5), ('agl2_6', self.std_agl2_6)]:
-            if key in lowdim:
-                lowdim[key] += torch.randn_like(lowdim[key]) * noise_agl * std
+        for key in lowdim:
+            if 'act' not in key:
+                lowdim[key] += torch.randn_like(lowdim[key]) * noise_agl * 0.1 # Simplified std
 
         lowdim_norm = self.scaler.normalize(lowdim)
         
-        # Concat lowdim [1, L, 14] -> Batch size is 1 trajectory
         concat_lowdim = torch.cat([
             lowdim_norm['agl_1'], lowdim_norm['agl_2'], lowdim_norm['agl_3'], lowdim_norm['agl_4'], 
             lowdim_norm['agl_5'], lowdim_norm['agl_6'], lowdim_norm['gripper_pos'],
@@ -78,10 +63,8 @@ class LitMambaJEPA(pl.LightningModule):
             lowdim_norm['gripper_pos2']
         ], dim=-1).unsqueeze(0)
 
-        # RGB Dict transformation: {cam: [1, L, 3, H, W]}
         rgb_seq = {cam: rgb[cam].unsqueeze(0) for cam in rgb}
 
-        # Target actions [1, L, 16, 14]
         gt_actions = torch.cat([
             lowdim_norm['agl_1_act'], lowdim_norm['agl_2_act'], lowdim_norm['agl_3_act'],
             lowdim_norm['agl_4_act'], lowdim_norm['agl_5_act'], lowdim_norm['agl_6_act'],
@@ -95,25 +78,21 @@ class LitMambaJEPA(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         rgb, lowdim, _ = self._prepare_batch(batch)
-        
-        loss, _ = self.jepa(rgb, lowdim)
+        # num_context_points=20로 높여서 적은 궤적에서도 학습량을 확보
+        loss, _ = self.jepa(rgb, lowdim, num_context_points=20)
         
         self.jepa.update_ema(self.total_steps, self.max_training_steps)
         self.total_steps += 1
         
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("ema_momentum", self.jepa.current_momentum, on_step=True, on_epoch=False)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
         rgb, lowdim, gt_actions = self._prepare_batch(batch)
-        
-        loss, pred_actions = self.jepa(rgb, lowdim)
+        loss, pred_actions = self.jepa(rgb, lowdim, num_context_points=10)
         
         self.log("val_loss", loss, prog_bar=True, on_epoch=True)
         
-        # Metrics update
         ctx_len = pred_actions.shape[1]
         pred_actions_denorm = self.denormalize(pred_actions.reshape(-1, 16, 14))
         gt_actions_denorm = self.denormalize(gt_actions[:, :ctx_len].reshape(-1, 16, 14))
@@ -149,11 +128,9 @@ class LitMambaJEPA(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=1e-6)
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return optimizer
 
 def limit_dataset(dataset, max_trajs):
-    """기존 데이터셋 객체의 내부 리스트를 슬라이싱하여 궤적 수를 제한함"""
     if len(dataset.records) > max_trajs:
         dataset.records = dataset.records[:max_trajs]
         dataset.lengths = dataset.lengths[:max_trajs]
@@ -167,43 +144,37 @@ def main():
     config.img_size = (640, 480)
     root_path = "/home/jeonchanwook/MTIL/transfer.100"
     
-    # 1. 데이터셋 생성 (기존 MambaSequenceDataset 그대로 사용)
+    # 1. 데이터셋 10% 미만으로 빡세게 제한 (학습 10개, 검증 2개)
     train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", selected_cameras=config.camera_names)
     val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", selected_cameras=config.camera_names)
     
-    # 2. 궤적 수 제한 (200개로 제한)
-    train_dataset = limit_dataset(train_dataset, 200)
-    val_dataset = limit_dataset(val_dataset, 50)
+    train_dataset = limit_dataset(train_dataset, 10) 
+    val_dataset = limit_dataset(val_dataset, 2)
     
     scaler = Scaler(lowdim_dict=train_dataset.lowdim_shapes)
     scaler.load('/home/jeonchanwook/MTIL/scaler_params.pth')
     train_dataset.scaler = scaler; val_dataset.scaler = scaler
     
-    # 3. Trajectory-based Batch Sampling 설정
-    # 1 Iteration = 1 Trajectory가 되도록 설정
     train_sampler = TrajectoryBatchSampler(train_dataset.cum_lengths, shuffle=True)
     val_sampler = TrajectoryBatchSampler(val_dataset.cum_lengths, shuffle=False)
     
+    # num_workers를 줄여서 오버헤드 방지
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=4, pin_memory=True)
     
     model = LitMambaJEPA(config, scaler)
     csv_logger = CSVLogger("lightning_logs", name="jepa")
     
-    lr_monitor = LearningRateMonitor(logging_interval='step')
-    ckpt_cb = ModelCheckpoint(monitor='val_loss', mode='min', save_last=True, save_top_k=2, filename="jepa-{epoch}")
-
     trainer = pl.Trainer(
-        max_epochs=5, # 5 Epoch 설정
+        max_epochs=5,
         accelerator='gpu',
         devices=1,
         logger=csv_logger,
-        callbacks=[lr_monitor, ckpt_cb],
         precision=32,
-        gradient_clip_val=1.0
+        enable_checkpointing=True
     )
     
-    print(f"Training started: {len(train_sampler)} trajectories per epoch.")
+    print(f"Smoke test started: {len(train_sampler)} train trajs, {len(val_sampler)} val trajs.")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":
