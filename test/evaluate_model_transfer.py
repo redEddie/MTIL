@@ -1,11 +1,13 @@
 import os
-from inference_M import MyInferenceModel
+import matplotlib
+matplotlib.use('Agg')
+from test.inference_M import MyInferenceModel
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from einops import rearrange
-from sim_env import make_sim_env, BOX_POSE
-from visualize_episodes import save_videos
+from test.sim_env import make_sim_env, BOX_POSE
+from test.visualize_episodes import save_videos
 from train.mamba_policy import MambaPolicy, MambaConfig
 from train.scaler_M import Scaler
 from train.M_dataset import MambaSequenceDataset
@@ -69,8 +71,10 @@ def get_image(ts, camera_names):
 
 
 scaler_path = 'scaler_params.pth'  # your own path
-checkpoint = 'last.ckpt'  # your own path
+checkpoint = 'lightning_logs/version_1/checkpoints/last.ckpt'  # updated path
 results_dir = 'video'  # your own path
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
 #  初始化推理模型
 config = MambaConfig()
 config.camera_names = ['top']
@@ -105,7 +109,7 @@ query_frequency = 1  # 每个时间步上都进行一次查询
 max_timesteps = 400  # 最大任务时间长度
 max_timesteps = int(max_timesteps * 1)
 num_queries = 16  # 预测步长
-num_rollouts = 50  # 评估的回合数
+num_rollouts = 1  # 评估的回合数
 episode_returns = []  # 用于存储每个回合的总回报
 highest_rewards = []  # 用于存储每个回合的最高奖励
 state_dim = 14
@@ -133,26 +137,27 @@ for rollout_id in range(num_rollouts):
     all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, state_dim]).cuda()
     ts = env.reset()
     # onscreen render
-    ax = plt.subplot()
-    plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-    plt.ion()
+    # ax = plt.subplot()
+    # plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+    # plt.ion()
     infer_model.reset_hiddens()
     image_list = []  # for visualization
     qpos_list = []
     target_qpos_list = []
     rewards = []
+    inference_times = []
     temporal_agg = True  # 是否使用时间聚合
     # 增加渲染
-    ax = plt.subplot()
-    plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-    plt.ion()
+    # ax = plt.subplot()
+    # plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+    # plt.ion()
 
     with torch.inference_mode():
-        for t in range(max_timesteps):
+        for t in tqdm(range(max_timesteps), desc=f"Rollout {rollout_id}", leave=False):
             # update onscreen render and wait for DT
-            image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-            plt_img.set_data(image)
-            plt.pause(DT)
+            # image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
+            # plt_img.set_data(image)
+            # plt.pause(DT)
             # process previous timestep to get qpos and image_list
             obs = ts.observation
             if 'images' in obs:
@@ -201,10 +206,12 @@ for rollout_id in range(num_rollouts):
             curr_image = get_image(ts, camera_names)
             # 推理
             if t % query_frequency == 0:
+                inf_start = time.time()
                 pred_action = infer_model(lowdim_norm, curr_image)
                 pred_denorm = infer_model.denormalize(pred_action)
                 a_hat = pred_denorm.view(1, 16, 14)
                 all_actions = a_hat
+                inference_times.append(time.time() - inf_start)
             if temporal_agg:
                 all_time_actions[[t], t:t + num_queries] = all_actions
                 actions_for_curr_step = all_time_actions[:, t]
@@ -231,8 +238,11 @@ for rollout_id in range(num_rollouts):
     episode_returns.append(episode_return)
     episode_highest_reward = np.max(rewards)
     highest_rewards.append(episode_highest_reward)
+    avg_inf_ms = np.mean(inference_times) * 1000
+    fps = 1.0 / np.mean(inference_times)
     print(
         f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward == env_max_reward}')
+    print(f'평균 추론 시간: {avg_inf_ms:.2f} ms, FPS: {fps:.2f}')
     save_videos(image_list, DT, video_path=os.path.join(results_dir, f'video{rollout_id}.mp4'))
 
 success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
@@ -243,7 +253,7 @@ for r in range(env_max_reward + 1):
     more_or_equal_r_rate = more_or_equal_r / num_rollouts
     summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate * 100}%\n'
 print(summary_str)
-print(f'成功率：{success_rate}, 平均回报：{avg_return}')
+print(f'성공률: {success_rate}, 평균 보상: {avg_return}')
 # # save success rate to txt
 # result_file_name = 'result_' + '.txt'
 # with open(os.path.join(results_dir, result_file_name), 'w') as f:
@@ -251,7 +261,7 @@ print(f'成功率：{success_rate}, 平均回报：{avg_return}')
 #     f.write(repr(episode_returns))
 #     f.write('\n\n')
 #     f.write(repr(highest_rewards))
-# print(f'成功率：{success_rate}, 平均回报：{avg_return}')
+# print(f'성공률: {success_rate}, 평균 보상: {avg_return}')
 
 
 

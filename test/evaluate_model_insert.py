@@ -1,5 +1,5 @@
 import os
-from inference_M import MyInferenceModel
+from test.inference_M import MyInferenceModel
 import numpy as np
 import matplotlib.pyplot as plt
 import torch

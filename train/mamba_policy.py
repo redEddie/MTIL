@@ -464,15 +464,6 @@ class FrozenDinov2(nn.Module):
         # 冻结所有参数
         for param in self.dino.parameters():
             param.requires_grad_(False)
-        # 注册前向钩子获取中间层输出
-        self.feature_hook = self._register_hook()
-
-    def _register_hook(self):
-        # 获取完整的三维输出张量
-        def hook(module, input, output):
-            self.intermediate_output = output
-        handle = self.dino.blocks[self.layer_index].register_forward_hook(hook)
-        return handle
 
     # adaptive_resize
     def adaptive_resize(self, img, min_patches=8):
@@ -481,7 +472,7 @@ class FrozenDinov2(nn.Module):
         scale = max(min_size / min(H, W), 1.0)  # 确保缩放比例≥1
         new_H = max(round(H * scale), min_size)
         new_W = max(round(W * scale), min_size)
-        # 强制对齐到patch_size的整数倍
+        # 强制对齐到patch_size의 정수배
         new_H = ((new_H + self.patch_size - 1) // self.patch_size) * self.patch_size
         new_W = ((new_W + self.patch_size - 1) // self.patch_size) * self.patch_size
         return TF.resize(img, (new_H, new_W), antialias=True)
@@ -491,16 +482,18 @@ class FrozenDinov2(nn.Module):
         x = self.adaptive_resize(x)
         B, C, H, W = x.shape
 
-        # 前向传播获取中间层特征
-        _ = self.dino(x)  # 触发前向钩子
-
-        # 获取中间层特征（shape: [B, num_patches, dim]）
-        features = self.intermediate_output
+        # Use native get_intermediate_layers (more robust with deepcopy)
+        # layer_index -4 means we want the 4th layer from the end
+        n = abs(self.layer_index)
+        # returns List[torch.Tensor] with shape [B, num_patches, dim]
+        layers = self.dino.get_intermediate_layers(x, n=n)
+        features = layers[0] 
 
         # 重组为2D特征图
         H_patch = H // self.patch_size
         W_patch = W // self.patch_size
-        features = features[:, 1:, :]  # 去除CLS token
+        # get_intermediate_layers without return_class_token=True only returns patches
+        # So we don't need features[:, 1:, :] anymore.
         features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
         return features  # [B, dim, H_patch, W_patch]
 
@@ -638,12 +631,13 @@ class MambaPolicy(nn.Module):
             hidden_list.append((conv_st, ssm_st))
         return hidden_list
 
-    def step(self, lowdim_t, images_t, hidden_states):
+    def step(self, lowdim_t, images_t, hidden_states, return_repr=False):
         """
         单帧前向:
           lowdim_t: [B, lowdim_dim]
           images_t: dict of [B, 3, H, W] => 单帧输入
           hidden_states: list of (conv_st, ssm_st) per block，每个 Block 的隐藏状态
+          return_repr: 如果为 True, 则返回 (action_t, new_states, hidden)
         返回:
           pred_action: [B, action_dim]
           new_hidden_states: List[Tensor]
@@ -719,6 +713,9 @@ class MambaPolicy(nn.Module):
             # d) out => action
         action_flat = self.out_proj(hidden)# => [B, 16×14=224]
         action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
+        
+        if return_repr:
+            return action_t, new_states, hidden
         return action_t, new_states
 
 # forward一般不使用

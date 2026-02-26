@@ -97,20 +97,20 @@ class Scaler(nn.Module):
 
     def save(self, filepath: str):
         """
-        将 Scaler 的参数保存到文件。
+        Scaler의 파라미터를 파일로 저장합니다.
 
-        参数:
-        filepath (str): 保存路径
+        매개변수:
+        filepath (str): 저장 경로
         """
         torch.save(self.state_dict(), filepath)
-        print(f"Scaler 参数已保存到 {filepath}")
+        print(f"Scaler 파라미터가 {filepath}에 저장되었습니다.")
 
     def load(self, filepath: str):
         """
-        从文件加载 Scaler 的参数。
+        파일에서 Scaler의 파라미터를 로드합니다.
 
-        参数:
-        filepath (str): 加载路径
+        매개변수:
+        filepath (str): 로드 경로
         """
         self.load_state_dict(torch.load(filepath, map_location='cpu'))
-        print(f"Scaler 参数已从 {filepath} 加载")
+        print(f"Scaler 파라미터가 {filepath}에서 로드되었습니다.")
