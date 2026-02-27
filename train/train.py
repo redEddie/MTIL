@@ -18,7 +18,8 @@ class LitMambaModel(pl.LightningModule):
     def __init__(self, config: MambaConfig, scaler: Scaler, future_steps: int = 16):
         super().__init__()
         self.save_hyperparameters(ignore=["scaler"])
-        self.metric = my_Metric()
+        self.metric = my_Metric()  # Validation용
+        self.train_metric = my_Metric()  # Training용 추가
         self.prev_traj_idx = -1  # 初始化上一个轨迹索引
         self.future_steps = future_steps
         # Register train and val sequence_loss as buffers
@@ -135,7 +136,7 @@ class LitMambaModel(pl.LightningModule):
         # 检测是否是新轨迹
         if traj_idx != self.prev_traj_idx and self.prev_traj_idx != -1:
             # 执行优化步骤
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)  # 梯度裁剪
             optimizer.step()
             optimizer.zero_grad()
             # 记录累积的训练损失
@@ -197,6 +198,21 @@ class LitMambaModel(pl.LightningModule):
 
         # 反向传播
         self.manual_backward(loss)
+
+        # 상세 에러 기록을 위해 역정규화 후 메트릭 업데이트
+        with torch.no_grad():
+            denorm_pred = self.denormalize(pred_action)
+            denorm_gt = self.denormalize(actions)
+            self.train_metric.update(denorm_pred, denorm_gt)
+            
+            # 터미널용 실시간 합계 에러 계산
+            # 관절(0:6, 7:13) MAE 합계
+            joint_mae = torch.abs(denorm_pred[..., [0,1,2,3,4,5,7,8,9,10,11,12]] - denorm_gt[..., [0,1,2,3,4,5,7,8,9,10,11,12]]).sum()
+            # 그리퍼(6, 13) MAE 합계
+            grip_mae = torch.abs(denorm_pred[..., [6,13]] - denorm_gt[..., [6,13]]).sum()
+            
+            self.log("j_sum", joint_mae, prog_bar=True, logger=False)
+            self.log("g_sum", grip_mae, prog_bar=True, logger=False)
 
         # 累积损失
         self.train_sequence_loss += loss.item()
@@ -272,11 +288,32 @@ class LitMambaModel(pl.LightningModule):
         return loss  # 返回当前步骤的损失
 
     def on_train_epoch_end(self):
-        optimizer = self.optimizers()  # 获取优化器
+        optimizer = self.optimizers()
+
+        # 상세 훈련 메트릭 계산 및 로깅
+        train_metrics = self.train_metric.compute()
+        # CSV용: 모든 상세 메트릭 저장
+        train_csv_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+        self.log_dict(train_csv_metrics, prog_bar=False, sync_dist=True)
+        
+        # --- 터미널 출력 (간략 + 상세) ---
+        total_j_mae = torch.stack([v for k, v in train_metrics.items() if 'angle_error' in k and 'mae' in k]).sum()
+        total_g_mae = torch.stack([v for k, v in train_metrics.items() if 'width_error' in k and 'mae' in k]).sum()
+        
+        print(f"\n" + "="*50)
+        print(f" 🔥 [Epoch {self.current_epoch} TRAIN SUMMARY]")
+        print(f" > Total Joint MAE: {total_j_mae:.4f} | Total Grip MAE: {total_g_mae:.4f}")
+        print("-" * 50)
+        print(f" [Arm1 Detail] A1:{train_metrics['agl_1_act_mae_angle_error']:.4f} A2:{train_metrics['agl_2_act_mae_angle_error']:.4f} A3:{train_metrics['agl_3_act_mae_angle_error']:.4f} A4:{train_metrics['agl_4_act_mae_angle_error']:.4f} A5:{train_metrics['agl_5_act_mae_angle_error']:.4f} A6:{train_metrics['agl_6_act_mae_angle_error']:.4f}")
+        print(f" [Arm2 Detail] A1:{train_metrics['agl2_1_act_mae_angle_error']:.4f} A2:{train_metrics['agl2_2_act_mae_angle_error']:.4f} A3:{train_metrics['agl2_3_act_mae_angle_error']:.4f} A4:{train_metrics['agl2_4_act_mae_angle_error']:.4f} A5:{train_metrics['agl2_5_act_mae_angle_error']:.4f} A6:{train_metrics['agl2_6_act_mae_angle_error']:.4f}")
+        print(f" [Grip Detail] G1:{train_metrics['gripper_act_mae_width_error']:.4f} G2:{train_metrics['gripper_act2_mae_width_error']:.4f}")
+        print("="*50 + "\n")
+        
+        self.train_metric.reset()
 
         # 处理最后一条轨迹的累积损失
         if self.train_sequence_loss > 0.0:
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 梯度裁剪（可选）
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)  # 梯度裁剪
             optimizer.step()
             optimizer.zero_grad()
             self.log("train_loss", self.train_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
@@ -346,25 +383,29 @@ class LitMambaModel(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         # 记录并重置验证指标
-        self.log_dict(self.metric.compute(), prog_bar=True, sync_dist=True)
-        self.metric.reset()
-
-        # 获取当前 epoch 的验证损失
-        val_loss = self.trainer.callback_metrics.get("val_loss")
-
-        if val_loss is not None:
-            # 使用存储的调度器对象
-            # self.lr_scheduler_obj.step(val_loss)
-            # print(f"Scheduler stepped with val_loss: {val_loss.item()}")
-
-            # 打印当前学习率以确认调度器是否生效
-            current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
-            print(f"Current Learning Rate: {current_lr}")
+        val_metrics = self.metric.compute()
+        # 개별 관절 에러는 요청하신 대로 접두어 없이 기록 (CSV 컬럼명 일치)
+        self.log_dict(val_metrics, prog_bar=True, sync_dist=True)
+        
+        # --- 터미널 출력 (간략 + 상세) ---
+        total_j_mae = torch.stack([v for k, v in val_metrics.items() if 'angle_error' in k and 'mae' in k]).sum()
+        total_g_mae = torch.stack([v for k, v in val_metrics.items() if 'width_error' in k and 'mae' in k]).sum()
+        
+        print(f"\n" + "="*50)
+        print(f" ✅ [Epoch {self.current_epoch} VAL SUMMARY]")
+        print(f" > Total Joint MAE: {total_j_mae:.4f} | Total Grip MAE: {total_g_mae:.4f}")
+        print("-" * 50)
+        print(f" [Arm1 Detail] A1:{val_metrics['agl_1_act_mae_angle_error']:.4f} A2:{val_metrics['agl_2_act_mae_angle_error']:.4f} A3:{val_metrics['agl_3_act_mae_angle_error']:.4f} A4:{val_metrics['agl_4_act_mae_angle_error']:.4f} A5:{val_metrics['agl_5_act_mae_angle_error']:.4f} A6:{val_metrics['agl_6_act_mae_angle_error']:.4f}")
+        print(f" [Arm2 Detail] A1:{val_metrics['agl2_1_act_mae_angle_error']:.4f} A2:{val_metrics['agl2_2_act_mae_angle_error']:.4f} A3:{val_metrics['agl2_3_act_mae_angle_error']:.4f} A4:{val_metrics['agl2_4_act_mae_angle_error']:.4f} A5:{val_metrics['agl2_5_act_mae_angle_error']:.4f} A6:{val_metrics['agl2_6_act_mae_angle_error']:.4f}")
+        print(f" [Grip Detail] G1:{val_metrics['gripper_act_mae_width_error']:.4f} G2:{val_metrics['gripper_act2_mae_width_error']:.4f}")
+        print("="*50 + "\n")
 
         self.log("val_epoch_loss", self.val_total_loss / self.val_total_steps if self.val_total_steps > 0 else 0.0,
                  prog_bar=True, sync_dist=True)
-        self.val_total_loss = 0.0  # 重置整个 epoch 的验证损失总和
-        self.val_total_steps = 0  # 重置整个 epoch 的验证步数
+        
+        self.metric.reset()
+        self.val_total_loss = 0.0
+        self.val_total_steps = 0
 
 #  main
 def main():

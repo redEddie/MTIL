@@ -633,33 +633,41 @@ class MambaPolicy(nn.Module):
 
     def step(self, lowdim_t, images_t, hidden_states, return_repr=False):
         """
-        单帧前向:
-          lowdim_t: [B, lowdim_dim]
-          images_t: dict of [B, 3, H, W] => 单帧输入
-          hidden_states: list of (conv_st, ssm_st) per block，每个 Block 的隐藏状态
-          return_repr: 如果为 True, 则返回 (action_t, new_states, hidden)
-        返回:
-          pred_action: [B, action_dim]
-          new_hidden_states: List[Tensor]
+        단일 프레임 추론 (Single-step Inference):
+          현재 시점(t)의 데이터와 이전까지의 기억(hidden_states)을 바탕으로 다음 행동을 결정합니다.
+
+          lowdim_t: [B, lowdim_dim] 크기의 저차원 상태 데이터 (예: 로봇 관절 각도, 그리퍼 상태 등)
+          images_t: {카메라_이름: [B, 3, H, W]} 형태의 딕셔너리, 현재 시점의 단일 프레임 이미지 입력
+          hidden_states: Mamba 블록별 (conv_st, ssm_st) 은닉 상태 리스트. 이전 스텝에서 전달받은 '기억'입니다.
+          return_repr: True일 경우, 액션 헤드 통과 전의 고차원 특징 벡터(hidden)를 함께 반환합니다. (JEPA 학습 등에 활용)
+
+        반환값:
+          action_t: [B, future_steps, action_dim] 크기의 예측된 미래 동작 시퀀스 (Action Chunking)
+          new_states: 현재 시점의 정보가 반영되어 업데이트된 은닉 상태 리스트. 다음 스텝의 'hidden_states'로 입력해야 합니다.
+          hidden (선택): return_repr=True일 때 반환되는 고차원 추상 표현 벡터 [B, d_model]
         """
         B, _ = lowdim_t.shape
         device = lowdim_t.device
 
-        # 1. 多相机特征提取
+        # 1. 멀티 카메라 시각 특징 추출
 
         feats_all = []
         for cam in self.camera_names:
             img = images_t[cam]
-            raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
-            # 空间压缩与通道调整
+            # DINOv2 백본을 통해 고차원 특징 추출: [B, 1024, H_patch, W_patch]
+            raw_feat = self.shared_backbone(img)  
+            
+            # 공간 압축 및 채널 조정 (이미지 해상도에 따른 어댑터 선택)
             if self.img_size == (640, 480):
-                feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
+                feat = self.spatial_adapter(raw_feat)  # [B, embed_dim]
             elif self.img_size == (128, 128):
-                feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+                feat = self.spatial_adapter_low(raw_feat) # [B, embed_dim]
             feats_all.append(feat)
 
+        # 추출된 모든 카메라 특징을 하나로 결합
         cam_feats = torch.cat(feats_all, dim=1)
-        # 跨相机注意力
+        
+        # 카메라가 여러 대일 경우, 카메라 간 교차 어텐션(Cross-Camera Attention) 수행
         if self.num_cameras > 1:
             cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
                                             cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
