@@ -1,0 +1,34 @@
+config: !!python/object:train.mamba_policy.MambaConfig
+  A_init_range: !!python/tuple
+  - 1
+  - 16
+  action_dim: 14
+  activation: swish
+  camera_names:
+  - top
+  chunk_size: 256
+  d_conv: 4
+  d_model: 2048
+  d_state: 512
+  dt_init_floor: 0.0001
+  dt_limit: !!python/tuple
+  - 0.0
+  - .inf
+  dt_max: 0.02
+  dt_min: 0.001
+  embed_dim: 2048
+  expand: 2
+  freeze_backbone: true
+  headdim: 128
+  img_size: !!python/tuple
+  - 640
+  - 480
+  learnable_init_states: false
+  lowdim_dim: 14
+  mamba_bias: false
+  mamba_conv_bias: true
+  ngroups: 1
+  num_blocks: 4
+  pretrained_backbone: true
+  sum_camera_feats: false
+  use_mem_eff_path: true
