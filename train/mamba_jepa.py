@@ -48,53 +48,46 @@ class MambaJEPA(nn.Module):
 
     def forward(self, images, lowdim, num_context_points=10, prediction_horizon=16):
         """
-        images: dict of {cam_name: [B, L, 3, H, W]}
-        lowdim: [B, L, D]
-        num_context_points: 한 궤적 내에서 학습할 'Context 종료 지점'의 개수
-        prediction_horizon: 각 지점에서 미래로 몇 스텝을 예측할지
+        Pure JEPA Forward: Predicts future representations only.
         """
         B, L, _ = lowdim.shape
         device = lowdim.device
         
-        # 1. Target Encoding (전체 시퀀스의 표현형을 먼저 추출)
+        # 1. Target Encoding (Full Sequence)
         with torch.no_grad():
             target_repr_list = []
             h_target = self.target_model.init_hidden_states(B, device)
             for t in range(L):
                 imgs_t = {cam: images[cam][:, t] for cam in self.target_model.camera_names}
+                # We ignore the first return value (action)
                 _, h_target, hidden = self.target_model.step(lowdim[:, t], imgs_t, h_target, return_repr=True)
                 target_repr_list.append(hidden.unsqueeze(1)) 
             target_repr = torch.cat(target_repr_list, dim=1) # [B, L, d_model]
 
-        # 2. Context Encoding (전체 시퀀스를 훑으며 각 시점의 Hidden State 추출)
+        # 2. Context Encoding (Full Sequence)
         context_repr_list = []
-        pred_actions_list = []
         h_context = self.context_model.init_hidden_states(B, device)
         for t in range(L):
             imgs_t = {cam: images[cam][:, t] for cam in self.context_model.camera_names}
-            pred_act, h_context, hidden = self.context_model.step(lowdim[:, t], imgs_t, h_context, return_repr=True)
+            # We ignore the first return value (action)
+            _, h_context, hidden = self.context_model.step(lowdim[:, t], imgs_t, h_context, return_repr=True)
             context_repr_list.append(hidden.unsqueeze(1))
-            pred_actions_list.append(pred_act.unsqueeze(1))
         
         context_reprs = torch.cat(context_repr_list, dim=1) # [B, L, d_model]
-        pred_actions = torch.cat(pred_actions_list, dim=1) # [B, L, future_steps, action_dim]
 
-        # 3. Predictor Training (여러 시점을 Context로 삼아 학습)
-        # 너무 촘촘하면 계산량이 많으므로 num_context_points 만큼 무작위 지점을 선택
-        # 단, 미래 데이터가 남아있는 지점들 중에서 선택 (1 ~ L - 2)
-        if L < 5: # 궤적이 너무 짧으면 처리 불가
-            return torch.tensor(0.0, device=device, requires_grad=True), pred_actions
+        # 3. Predictor Training (Dense Temporal Prediction)
+        if L < 5:
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
         loss = 0
         actual_points = 0
         
-        # Context 종료 지점 샘플링
+        # Sample context points
         indices = torch.randperm(L - 1)[:num_context_points].tolist()
         
         for t_ctx in indices:
-            ctx_v = context_reprs[:, t_ctx] # t_ctx 시점까지의 누적 정보
+            ctx_v = context_reprs[:, t_ctx]
             
-            # 해당 시점으로부터 미래 prediction_horizon 만큼 예측
             max_h = min(prediction_horizon, L - 1 - t_ctx)
             if max_h <= 0: continue
             
@@ -110,6 +103,6 @@ class MambaJEPA(nn.Module):
                 actual_points += 1
         
         if actual_points > 0:
-            return loss / actual_points, pred_actions
+            return loss / actual_points
         else:
-            return torch.tensor(0.0, device=device, requires_grad=True), pred_actions
+            return torch.tensor(0.0, device=device, requires_grad=True)

@@ -6,7 +6,6 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Sampler
 import torch.nn.functional as F
 from pytorch_lightning import seed_everything
-from train.metric_M import my_Metric
 from train.scaler_M import Scaler
 from train.M_dataset import MambaSequenceDataset
 from train.mamba_jepa import MambaJEPA
@@ -36,22 +35,21 @@ class LitMambaJEPA(pl.LightningModule):
         self.save_hyperparameters(ignore=["scaler"])
         self.jepa = MambaJEPA(config)
         self.scaler = scaler
-        self.metric = my_Metric()
         
         self.lr = 1e-4
         self.weight_decay = 1e-4
         self.total_steps = 0
-        self.max_training_steps = 5000 # Reduced for small dataset
+        self.max_training_steps = 5000 
 
     def _prepare_batch(self, batch):
         rgb = batch['rgb']
         lowdim = batch['lowdim']
         
-        # Noise injection
+        # Noise injection (for robustness in representation learning)
         noise_agl = 0.02
         for key in lowdim:
             if 'act' not in key:
-                lowdim[key] += torch.randn_like(lowdim[key]) * noise_agl * 0.1 # Simplified std
+                lowdim[key] += torch.randn_like(lowdim[key]) * noise_agl * 0.1
 
         lowdim_norm = self.scaler.normalize(lowdim)
         
@@ -64,22 +62,11 @@ class LitMambaJEPA(pl.LightningModule):
         ], dim=-1).unsqueeze(0)
 
         rgb_seq = {cam: rgb[cam].unsqueeze(0) for cam in rgb}
-
-        gt_actions = torch.cat([
-            lowdim_norm['agl_1_act'], lowdim_norm['agl_2_act'], lowdim_norm['agl_3_act'],
-            lowdim_norm['agl_4_act'], lowdim_norm['agl_5_act'], lowdim_norm['agl_6_act'],
-            lowdim_norm['gripper_act'],
-            lowdim_norm['agl2_1_act'], lowdim_norm['agl2_2_act'], lowdim_norm['agl2_3_act'],
-            lowdim_norm['agl2_4_act'], lowdim_norm['agl2_5_act'], lowdim_norm['agl2_6_act'],
-            lowdim_norm['gripper_act2']
-        ], dim=-1).unsqueeze(0)
-
-        return rgb_seq, concat_lowdim, gt_actions
+        return rgb_seq, concat_lowdim
 
     def training_step(self, batch, batch_idx):
-        rgb, lowdim, _ = self._prepare_batch(batch)
-        # num_context_points=20로 높여서 적은 궤적에서도 학습량을 확보
-        loss, _ = self.jepa(rgb, lowdim, num_context_points=20)
+        rgb, lowdim = self._prepare_batch(batch)
+        loss = self.jepa(rgb, lowdim, num_context_points=20)
         
         self.jepa.update_ema(self.total_steps, self.max_training_steps)
         self.total_steps += 1
@@ -88,43 +75,11 @@ class LitMambaJEPA(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        rgb, lowdim, gt_actions = self._prepare_batch(batch)
-        loss, pred_actions = self.jepa(rgb, lowdim, num_context_points=10)
+        rgb, lowdim = self._prepare_batch(batch)
+        loss = self.jepa(rgb, lowdim, num_context_points=10)
         
         self.log("val_loss", loss, prog_bar=True, on_epoch=True)
-        
-        ctx_len = pred_actions.shape[1]
-        pred_actions_denorm = self.denormalize(pred_actions.reshape(-1, 16, 14))
-        gt_actions_denorm = self.denormalize(gt_actions[:, :ctx_len].reshape(-1, 16, 14))
-        self.metric.update(pred_actions_denorm, gt_actions_denorm)
-        
         return loss
-
-    def on_validation_epoch_end(self):
-        self.log_dict(self.metric.compute(), prog_bar=True)
-        self.metric.reset()
-
-    def denormalize(self, actions):
-        arm1_dict = {
-            'agl_1_act': actions[..., 0:1], 'agl_2_act': actions[..., 1:2], 'agl_3_act': actions[..., 2:3],
-            'agl_4_act': actions[..., 3:4], 'agl_5_act': actions[..., 4:5], 'agl_6_act': actions[..., 5:6],
-            'gripper_act': actions[..., 6:7]
-        }
-        arm2_dict = {
-            'agl2_1_act': actions[..., 7:8], 'agl2_2_act': actions[..., 8:9], 'agl2_3_act': actions[..., 9:10],
-            'agl2_4_act': actions[..., 10:11], 'agl2_5_act': actions[..., 11:12], 'agl2_6_act': actions[..., 12:13],
-            'gripper_act2': actions[..., 13:14]
-        }
-        arm1_denorm = self.scaler.denormalize(arm1_dict)
-        arm2_denorm = self.scaler.denormalize(arm2_dict)
-        return torch.cat([
-            arm1_denorm['agl_1_act'], arm1_denorm['agl_2_act'], arm1_denorm['agl_3_act'],
-            arm1_denorm['agl_4_act'], arm1_denorm['agl_5_act'], arm1_denorm['agl_6_act'],
-            arm1_denorm['gripper_act'],
-            arm2_denorm['agl2_1_act'], arm2_denorm['agl2_2_act'], arm2_denorm['agl2_3_act'],
-            arm2_denorm['agl2_4_act'], arm2_denorm['agl2_5_act'], arm2_denorm['agl2_6_act'],
-            arm2_denorm['gripper_act2']
-        ], dim=-1)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -144,10 +99,10 @@ def main():
     config.img_size = (640, 480)
     root_path = "/home/jeonchanwook/MTIL/transfer.100"
     
-    # 1. 데이터셋 10% 미만으로 빡세게 제한 (학습 10개, 검증 2개)
     train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", selected_cameras=config.camera_names)
     val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", selected_cameras=config.camera_names)
     
+    # 10 trajectories for quick testing
     train_dataset = limit_dataset(train_dataset, 10) 
     val_dataset = limit_dataset(val_dataset, 2)
     
@@ -158,7 +113,6 @@ def main():
     train_sampler = TrajectoryBatchSampler(train_dataset.cum_lengths, shuffle=True)
     val_sampler = TrajectoryBatchSampler(val_dataset.cum_lengths, shuffle=False)
     
-    # num_workers를 줄여서 오버헤드 방지
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, num_workers=4, pin_memory=True)
     
@@ -174,7 +128,7 @@ def main():
         enable_checkpointing=True
     )
     
-    print(f"Smoke test started: {len(train_sampler)} train trajs, {len(val_sampler)} val trajs.")
+    print(f"Pure JEPA Training (Representation Only): {len(train_sampler)} train trajs.")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":
