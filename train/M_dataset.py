@@ -5,7 +5,10 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
 from tqdm import trange, tqdm
-from scaler_M import Scaler  # 确保导入正确的 Scaler 类
+try:
+    from scaler_M import Scaler  # 确保导入正确的 Scaler 类
+except ImportError:
+    from train.scaler_M import Scaler  # 确保导入正确的 Scaler 类
 import h5py
 
 class MambaSequenceDataset(Dataset):
@@ -20,7 +23,8 @@ class MambaSequenceDataset(Dataset):
                  future_steps=16):  # <-- 未来多少步
         super().__init__()
         assert mode in ["train", "test"], "mode must be 'train' or 'test'"
-        self.dataset_dir = os.path.join(root_dir, mode)
+        self.dataset_dir = root_dir
+
         self.use_pose10d = use_pose10d
         self.resize_hw = resize_hw
         self.future_steps = future_steps
@@ -343,7 +347,7 @@ class MambaSequenceDataset(Dataset):
 
 
 def main():
-    root_dir = "/home/jeonchanwook/MTIL/transfer.100"  # 你自己的数据集目录
+    root_dir = "/home/pilab/workspace/MTIL/transfer.100"  # 你自己的数据集目录
     dataset = MambaSequenceDataset(root_dir=root_dir, mode="train", use_pose10d=True)
 
     # 计算归一化参数

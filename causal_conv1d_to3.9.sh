@@ -1,5 +1,5 @@
 # 1. causal_conv1d 패키지 경로 설정
-TARGET_DIR="$HOME/miniconda3/envs/mtil/lib/python3.9/site-packages/causal_conv1d"
+TARGET_DIR="/Data/pilab/anaconda3/envs/mtil/lib/python3.9/site-packages/causal_conv1d"
 
 # 2. '타입 | None' -> 'Optional[타입]' 치환
 find $TARGET_DIR -type f -name "*.py" -exec sed -i \

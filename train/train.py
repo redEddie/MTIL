@@ -384,14 +384,14 @@ def main():
 
     # 2) 构造 Dataset
     train_dataset = MambaSequenceDataset(
-        root_dir="/home/jeonchanwook/MTIL/transfer.100",  # put your own data path here
+        root_dir="/home/pilab/workspace/MTIL/transfer.100",  # put your own data path here
         mode="train",
         resize_hw=(640, 480),
         use_pose10d=True,
         selected_cameras=config.camera_names
     )
     val_dataset = MambaSequenceDataset(
-        root_dir="/home/jeonchanwook/MTIL/transfer.100",
+        root_dir="/home/pilab/workspace/MTIL/transfer.100",
         mode="test",
         resize_hw=(640, 480),
         use_pose10d=True,
@@ -461,7 +461,7 @@ def main():
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=[0],  # single GPU
-        max_epochs=200,
+        max_epochs=100,
         callbacks=[lr_monitor, ckpt_cb],
         precision=32
     )

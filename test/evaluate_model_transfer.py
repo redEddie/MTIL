@@ -68,8 +68,8 @@ def get_image(ts, camera_names):
     return curr_images
 
 
-scaler_path = 'scaler_params.pth'  # your own path
-checkpoint = 'last.ckpt'  # your own path
+scaler_path = '../train/scaler_params.pth'  # your own path
+checkpoint = '../mtil.transfer/checkpoints/last.ckpt'  # your own path
 results_dir = 'video'  # your own path
 #  初始化推理模型
 config = MambaConfig()
