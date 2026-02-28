@@ -88,6 +88,40 @@ class MambaJEPA(nn.Module):
             for c_param, t_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
                 t_param.data.mul_(self.current_momentum).add_(c_param.data, alpha=1 - self.current_momentum)
 
+    @torch.no_grad()
+    def encode_z(self, images):
+        # images['top']: [B, T, 3, H, W]
+        B, T, C, H, W = images['top'].shape
+        device = images['top'].device
+
+        patch_list = []
+        for t in range(T):
+            frame_patches = self.backbone(images['top'][:, t])
+            h_p, w_p = frame_patches.shape[-2], frame_patches.shape[-1]
+            N = h_p * w_p
+            frame_patches = rearrange(frame_patches, 'b c h w -> b 1 (h w) c')
+            patch_list.append(frame_patches)
+        patches = torch.cat(patch_list, dim=1)
+        tokens = self.patch_proj(patches)
+
+        curr_pos_embed = self.pos_embed
+        if curr_pos_embed.shape[1] != N:
+            curr_pos_embed = rearrange(curr_pos_embed, '1 (h w) d -> 1 d h w', h=self.num_h, w=self.num_w)
+            curr_pos_embed = F.interpolate(curr_pos_embed, size=(h_p, w_p), mode='bicubic', align_corners=False)
+            curr_pos_embed = rearrange(curr_pos_embed, '1 d h w -> 1 (h w) d')
+
+        time_embed = self.time_embed[:, :T]
+        tokens = tokens + curr_pos_embed.unsqueeze(1).to(device) + time_embed.to(device)
+        context_tokens = rearrange(tokens, 'b t n d -> b (t n) d')
+
+        context_latents = context_tokens
+        for blk in self.context_encoder:
+            context_latents, _ = blk(context_latents)
+
+        context_latents = rearrange(context_latents, 'b (t n) d -> b t n d', t=T)
+        z = context_latents.mean(dim=(1, 2))
+        return z
+
     def forward(self, images):
         # images['top']: [B, T, 3, 480, 640]
         B, T, C, H, W = images['top'].shape
@@ -117,7 +151,8 @@ class MambaJEPA(nn.Module):
             curr_pos_embed = F.interpolate(curr_pos_embed, size=(h_p, w_p), mode='bicubic', align_corners=False)
             curr_pos_embed = rearrange(curr_pos_embed, '1 d h w -> 1 (h w) d')
             
-        tokens = tokens + curr_pos_embed.unsqueeze(1).to(device) + self.time_embed.to(device)
+        time_embed = self.time_embed[:, :T]
+        tokens = tokens + curr_pos_embed.unsqueeze(1).to(device) + time_embed.to(device)
         
         # 3. Tube Masking
         num_masked = int(N * self.mask_ratio)
@@ -145,7 +180,7 @@ class MambaJEPA(nn.Module):
             
         # 6. Predictor (All-frame Prediction)
         space_pos = curr_pos_embed.unsqueeze(1).expand(B, T, -1, -1).to(device)
-        time_pos = self.time_embed.expand(B, -1, N, -1).to(device)
+        time_pos = time_embed.expand(B, -1, N, -1).to(device)
         full_pos = space_pos + time_pos
         
         target_pos = torch.gather(full_pos, 2, mask_idx.unsqueeze(1).unsqueeze(-1).expand(-1, T, -1, self.d_model))
@@ -162,5 +197,5 @@ class MambaJEPA(nn.Module):
         predicted_latents = rearrange(predicted_latents, 'b (t n) d -> b t n d', t=T)
         
         # 7. Loss
-        loss = F.mse_loss(predicted_latents, target_latents)
+        loss = F.smooth_l1_loss(predicted_latents, target_latents, beta=1.0, reduction='mean')
         return loss

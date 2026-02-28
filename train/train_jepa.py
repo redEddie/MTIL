@@ -5,7 +5,7 @@ import numpy as np
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from pytorch_lightning import seed_everything
-from train.M_dataset import MambaSequenceDataset
+from train.M_dataset_jepa import MambaSequenceDataset
 from train.mamba_jepa import MambaJEPA
 from train.mamba_policy import MambaConfig
 from pytorch_lightning.loggers import CSVLogger

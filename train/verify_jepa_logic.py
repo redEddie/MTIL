@@ -5,7 +5,7 @@ import sys
 # root(MTIL)에서 python -m train.verify_jepa_logic 로 실행할 때 내부 임포트가 작동하도록 함
 from train.mamba_jepa import MambaJEPA
 from train.mamba_policy import MambaConfig
-from train.M_dataset import MambaSequenceDataset
+from train.M_dataset_jepa import MambaSequenceDataset
 from train.scaler_M import Scaler
 
 def verify():
