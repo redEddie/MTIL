@@ -26,9 +26,9 @@ class MambaJEPA(nn.Module):
             nn.LayerNorm(self.d_model)
         )
         
-        # 3. 시공간 임베딩 (Space: 34x45 Sin/Cos, Time: 16 Learnable)
+        # 3. 시공간 임베딩 (Space: 34x45 Sin/Cos, Time: config.max_t Learnable)
         self.num_h, self.num_w = 34, 45 
-        self.max_t = 16
+        self.max_t = config.max_t
         
         pos_embed = self._get_2d_sincos_pos_embed(self.d_model, (self.num_h, self.num_w))
         self.pos_embed = nn.Parameter(torch.from_numpy(pos_embed).float().unsqueeze(0), requires_grad=True)
@@ -197,5 +197,5 @@ class MambaJEPA(nn.Module):
         predicted_latents = rearrange(predicted_latents, 'b (t n) d -> b t n d', t=T)
         
         # 7. Loss
-        loss = F.smooth_l1_loss(predicted_latents, target_latents, beta=1.0, reduction='mean')
+        loss = F.l1_loss(predicted_latents, target_latents, reduction='mean')
         return loss

@@ -11,13 +11,18 @@ import h5py
 class MambaSequenceDataset(Dataset):
     """
     윈도우 기반 스마트 로더: 
-    궤적 전체를 로드하지 않고, 16프레임 단위의 윈도우를 직접 인덱싱하여 로드함.
+    궤적 전체를 로드하지 않고, frame_skip 간격으로 num_frames 단위의 윈도우를 인덱싱하여 로드함.
     """
-    def __init__(self, root_dir: str, mode: str = "train", window_size: int = 16, 
+    def __init__(self, root_dir: str, mode: str = "train", num_frames: int = 10, frame_skip: int = 10,
                  selected_cameras: List[str] = None, resize_hw=(640,480)):
         super().__init__()
         self.dataset_dir = os.path.join(root_dir, mode)
-        self.window_size = window_size
+        self.num_frames = num_frames
+        self.frame_skip = frame_skip
+        
+        # 실제 데이터셋에서 차지하는 전체 윈도우의 길이 (예: 10프레임 * 10간격 = 91프레임 필요)
+        self.window_size = (self.num_frames - 1) * self.frame_skip + 1
+        
         self.selected_cameras = selected_cameras or ['top']
         self.resize_hw = resize_hw
         
@@ -46,12 +51,13 @@ class MambaSequenceDataset(Dataset):
         end_idx = frame_start + self.window_size
         
         with h5py.File(record_path, 'r') as root:
-            # 2. 필요한 16프레임만 딱 집어서 로드 (Smart Loading)
+            # 2. 필요한 프레임만 딱 집어서 로드 (Sparse Loading 적용)
             rgb_dict = {}
             for cam in self.selected_cameras:
-                img_seq = root[f'observations/images/{cam}'][frame_start:end_idx] # [16, H, W, 3]
+                # 시작점부터 끝점까지 frame_skip 간격으로 가져오기
+                img_seq = root[f'observations/images/{cam}'][frame_start:end_idx:self.frame_skip] # [num_frames, H, W, 3]
                 img_seq = img_seq.astype(np.float32) / 255.0
-                img_seq = np.transpose(img_seq, (0, 3, 1, 2)) # [16, 3, H, W]
+                img_seq = np.transpose(img_seq, (0, 3, 1, 2)) # [num_frames, 3, H, W]
                 rgb_dict[cam] = torch.tensor(img_seq, dtype=torch.float32)
                 
         return {

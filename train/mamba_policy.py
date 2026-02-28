@@ -66,6 +66,8 @@ class MambaConfig:
         self.sum_camera_feats=False
         self.num_blocks=4
         self.img_size=(640,480)
+        self.max_t=16             # maximum number of frames for temporal sequence
+
 
 #########################################
 # 1)  Mamba2

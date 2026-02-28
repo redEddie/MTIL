@@ -48,10 +48,11 @@ def main():
     config.num_blocks = 4 
     config.camera_names = ['top']
     config.img_size = (640, 480)
+    config.max_t = 10  # 10 프레임 (2초 분량)으로 설정
     
     root_path = "/home/jeonchanwook/MTIL/transfer.100"
-    train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", window_size=16)
-    val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", window_size=16)
+    train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", num_frames=10, frame_skip=10)
+    val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", num_frames=10, frame_skip=10)
     
     print(f"JEPA dataset windows - train: {len(train_dataset)}, val: {len(val_dataset)}")
 

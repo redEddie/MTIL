@@ -12,16 +12,17 @@ class SAPostTraiingDataset(Dataset):
     """
     (s, a, z) post-training dataset.
     - s: current state qpos[t]
-    - a: future action chunk action[t:t+future_steps] (training target)
+    - a: future action chunk action[t:t+future_steps] (training target, dense)
     - prev_action: action[t-1] (optional policy input for SAZ mode)
-    - z input: image history I[t-history_steps+1:t] with repeat-first-frame padding
+    - z input: image history I[t-(history_frames-1)*frame_skip:t:frame_skip] with repeat-first-frame padding (sparse)
     """
 
     def __init__(
         self,
         root_dir: str,
         mode: str = "train",
-        history_steps: int = 16,
+        history_frames: int = 10,
+        frame_skip: int = 10,
         future_steps: int = 16,
         selected_cameras: List[str] = None,
         resize_hw=(640, 480),
@@ -29,7 +30,8 @@ class SAPostTraiingDataset(Dataset):
         super().__init__()
         assert mode in ["train", "test"], "mode must be 'train' or 'test'"
         self.dataset_dir = os.path.join(root_dir, mode)
-        self.history_steps = history_steps
+        self.history_frames = history_frames
+        self.frame_skip = frame_skip
         self.future_steps = future_steps
         self.selected_cameras = selected_cameras or ["top"]
         self.resize_hw = resize_hw
@@ -90,14 +92,24 @@ class SAPostTraiingDataset(Dataset):
             )
             action_chunk = action[action_indices]
 
-            valid_len = min(frame_idx + 1, self.history_steps)
+            valid_len = 0
             history_indices = []
-            start_idx = frame_idx - self.history_steps + 1
-            for offset in range(self.history_steps):
-                src_idx = start_idx + offset
-                if src_idx < 0:
-                    src_idx = 0
-                history_indices.append(src_idx)
+            
+            # 과거 프레임 수집: t, t-frame_skip, t-2*frame_skip ...
+            for f in range(self.history_frames):
+                # f=0 이면 frame_idx (현재 시점)
+                offset = f * self.frame_skip
+                src_idx = frame_idx - offset
+                
+                # 유효한 프레임인 경우
+                if src_idx >= 0:
+                    valid_len += 1
+                else:
+                    src_idx = 0  # 부족한 부분은 맨 첫 프레임으로 패딩(padding)
+
+                # 시간 순서대로 나열하기 위해 리스트 맨 앞에 추가(insert)
+                # 최종적으로 [과거 ..., 현재-skip, 현재] 순서가 되도록
+                history_indices.insert(0, src_idx)
 
             rgb_hist = {}
             for cam in self.selected_cameras:
@@ -105,9 +117,9 @@ class SAPostTraiingDataset(Dataset):
                 frames = [self._to_chw_float(cam_ds[src_idx]) for src_idx in history_indices]
                 rgb_hist[cam] = torch.from_numpy(np.stack(frames, axis=0)).float()
 
-        history_mask = torch.zeros(self.history_steps, dtype=torch.float32)
+        history_mask = torch.zeros(self.history_frames, dtype=torch.float32)
         history_mask[-valid_len:] = 1.0
-        valid_ratio = torch.tensor(float(valid_len) / float(self.history_steps), dtype=torch.float32)
+        valid_ratio = torch.tensor(float(valid_len) / float(self.history_frames), dtype=torch.float32)
 
         return {
             "state": torch.from_numpy(state_t).float(),

@@ -258,6 +258,7 @@ def main():
     config.num_blocks = 4
     config.camera_names = ["top"]
     config.img_size = (640, 480)
+    config.max_t = 10  # 10 프레임 (2초 분량) 유지
 
     root_path = args.root_path
     if not os.path.exists(root_path):
@@ -268,14 +269,16 @@ def main():
     train_dataset = SAPostTraiingDataset(
         root_dir=root_path,
         mode="train",
-        history_steps=16,
+        history_frames=10,
+        frame_skip=10,
         future_steps=16,
         selected_cameras=config.camera_names,
     )
     val_dataset = SAPostTraiingDataset(
         root_dir=root_path,
         mode="test",
-        history_steps=16,
+        history_frames=10,
+        frame_skip=10,
         future_steps=16,
         selected_cameras=config.camera_names,
     )
