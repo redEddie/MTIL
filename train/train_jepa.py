@@ -5,9 +5,9 @@ import numpy as np
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from pytorch_lightning import seed_everything
-from train.M_dataset_jepa import MambaSequenceDataset
-from train.mamba_jepa import MambaJEPA
-from train.mamba_policy import MambaConfig
+from M_dataset_jepa import MambaSequenceDataset
+from mamba_jepa import MambaJEPA
+from mamba_policy import MambaConfig
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -50,15 +50,14 @@ def main():
     config.img_size = (640, 480)
     config.max_t = 10  # 10 프레임 (2초 분량)으로 설정
     
-    root_path = "/home/jeonchanwook/MTIL/transfer.100"
+    root_path = "/home/pilab/workspace/MTIL/transfer.50"
     train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", num_frames=10, frame_skip=10)
     val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", num_frames=10, frame_skip=10)
     
     print(f"JEPA dataset windows - train: {len(train_dataset)}, val: {len(val_dataset)}")
 
-    # OOM 방지를 위해 Batch Size 1로 축소
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4)
 
     model = LitMambaJEPA(config)
     csv_logger = CSVLogger(

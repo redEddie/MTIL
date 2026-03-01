@@ -4,10 +4,7 @@ import torch.nn.functional as F
 from copy import deepcopy
 from einops import rearrange, repeat
 import numpy as np
-try:
-    from train.mamba_policy import Mamba2, Block, FrozenDinov2, MambaConfig
-except ImportError:
-    from mamba_policy import Mamba2, Block, FrozenDinov2, MambaConfig
+from mamba_policy import Mamba2, Block, FrozenDinov2, MambaConfig
 
 class MambaJEPA(nn.Module):
     def __init__(self, config: MambaConfig, mask_ratio=0.6, base_momentum=0.996):

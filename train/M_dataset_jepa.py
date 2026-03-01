@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
 from tqdm import trange, tqdm
-from train.scaler_M import Scaler
+from scaler_M import Scaler
 import h5py
 
 class MambaSequenceDataset(Dataset):

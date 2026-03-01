@@ -6,13 +6,12 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from pytorch_lightning import seed_everything
-from train.metric_M import my_Metric
-from train.scaler_M import Scaler
+from metric_M import my_Metric
+from scaler_M import Scaler
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-
-from train.M_dataset import MambaSequenceDataset
-from train.mamba_policy import MambaPolicy, MambaConfig  # mamba2 + policy
+from M_dataset import MambaSequenceDataset
+from mamba_policy import MambaPolicy, MambaConfig  # mamba2 + policy
 
 class LitMambaModel(pl.LightningModule):
     def __init__(self, config: MambaConfig, scaler: Scaler, future_steps: int = 16):
