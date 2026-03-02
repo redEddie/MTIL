@@ -3,7 +3,7 @@ import sys
 import torch
 import torch.nn as nn
 import numpy as np
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'train')))
 
 from train.scaler_M import Scaler
 from train.mamba_policy import MambaPolicy, MambaConfig

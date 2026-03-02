@@ -2,6 +2,7 @@ import os
 from typing import Dict, List
 
 import cv2
+cv2.setNumThreads(0)  # Add to avoid multiprocessing SIGABRT
 import h5py
 import numpy as np
 import torch

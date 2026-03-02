@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional
 from tqdm import trange, tqdm
-from train.scaler_M import Scaler  # 올바른 Scaler 클래스가 임포트되었는지 확인하십시오
+from scaler_M import Scaler  # 올바른 Scaler 클래스가 임포트되었는지 확인하십시오
 import h5py
 
 class MambaSequenceDataset(Dataset):

@@ -1,5 +1,7 @@
 import argparse
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from glob import glob
 from typing import Dict
 
@@ -12,9 +14,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
-from train.M_dataset_post_traiing_sa import SAPostTraiingDataset
-from train.mamba_jepa import MambaJEPA
-from train.mamba_policy import MambaConfig, Mamba2, Block
+from M_dataset_post_training_sa import SAPostTraiingDataset
+from mamba_jepa import MambaJEPA
+from mamba_policy import MambaConfig, Mamba2, Block
 
 class SAMambaPolicyHead(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, future_steps: int, action_dim: int, config: MambaConfig):
@@ -240,7 +242,7 @@ def resolve_jepa_ckpt(user_path: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_path", type=str, default="/home/jeonchanwook/MTIL/transfer.100")
+    parser.add_argument("--root_path", type=str, default="/home/jeonchanwook/MTIL/transfer.50")
     parser.add_argument("--jepa_ckpt_path", type=str, default="")
     parser.add_argument("--max_epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=6)
@@ -249,6 +251,7 @@ def main():
     parser.add_argument("--min_valid_weight", type=float, default=0.25)
     parser.add_argument("--min_prev_action_weight", type=float, default=0.5)
     parser.add_argument("--policy_input_mode", type=str, default="sz", choices=["sz", "saz"])
+    parser.add_argument("--devices", type=int, default=1, help="Number of GPUs to use")
     args = parser.parse_args()
 
     seed_everything(42)
@@ -324,7 +327,7 @@ def main():
     )
     trainer = pl.Trainer(
         accelerator="gpu",
-        devices=1,
+        devices=args.devices,
         max_epochs=args.max_epochs,
         logger=csv_logger,
         callbacks=[ckpt_cb],

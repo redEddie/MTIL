@@ -2,6 +2,8 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 from test.inference_M import MyInferenceModel
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'train')))
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -70,9 +72,9 @@ def get_image(ts, camera_names):
     return curr_images
 
 
-scaler_path = 'scaler_params.pth'  # your own path
-checkpoint = 'lightning_logs/version_1/checkpoints/last.ckpt'  # updated path
-results_dir = 'video'  # your own path
+scaler_path = '../train/scaler_params.pth'  # updated path, assuming it's in train/ or root if missing. wait, let me just change checkpoint
+checkpoint = '../train/lightning_logs/version_4/checkpoints/last.ckpt'  # updated path
+results_dir = 'mtil.video'  # your own path
 if not os.path.exists(results_dir):
     os.makedirs(results_dir)
 #  初始化推理模型
@@ -109,7 +111,7 @@ query_frequency = 1  # 每个时间步上都进行一次查询
 max_timesteps = 400  # 最大任务时间长度
 max_timesteps = int(max_timesteps * 1)
 num_queries = 16  # 预测步长
-num_rollouts = 100  # 评估的回合数
+num_rollouts = 10  # 评估的回合数
 episode_returns = []  # 用于存储每个回合的总回报
 highest_rewards = []  # 用于存储每个回合的最高奖励
 state_dim = 14
