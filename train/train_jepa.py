@@ -32,7 +32,7 @@ class LitMambaJEPA(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         images = batch['rgb']
         loss = self.model(images)
-        self.log("val_loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
@@ -51,13 +51,13 @@ def main():
     config.max_t = 10  # 10 프레임 (2초 분량)으로 설정
     
     root_path = "/home/pilab/workspace/MTIL/transfer.50"
-    train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", num_frames=10, frame_skip=10)
-    val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", num_frames=10, frame_skip=10)
+    train_dataset = MambaSequenceDataset(root_dir=root_path, mode="train", num_frames=10, base_hz=50, target_hz=4)
+    val_dataset = MambaSequenceDataset(root_dir=root_path, mode="test", num_frames=10, base_hz=50, target_hz=4)
     
     print(f"JEPA dataset windows - train: {len(train_dataset)}, val: {len(val_dataset)}")
 
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=8, pin_memory=True, prefetch_factor=2)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
 
     model = LitMambaJEPA(config)
     csv_logger = CSVLogger(
@@ -69,15 +69,16 @@ def main():
     trainer = pl.Trainer(
         max_epochs=5,
         accelerator='gpu',
-        devices=1,
+        devices=-1,
+        strategy='deepspeed_stage_2', # Zero Redundancy Optimizer(ZeRO-2) 활성화로 GPU 메모리 OOM 원천 차단
         logger=csv_logger,
         log_every_n_steps=1,
         precision="16-mixed", # 16비트 혼합 정밀도 사용 (메모리 절반 절약)
-        accumulate_grad_batches=4, # 4번의 배치를 모아서 업데이트 (실질적 Batch Size 4 효과)
+        accumulate_grad_batches=2,
         gradient_clip_val=1.0
     )
     
-    print(f"Starting JEPA Memory-Optimized Training (Precision: 16-mixed, Grad Accum: 4)")
+    print(f"Starting Highly-Optimized JEPA Training (DDP, precision=16-mixed, Dataloader RAM Caching)")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":

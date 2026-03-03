@@ -1,15 +1,19 @@
 import os
+import sys
+# mtil root (to find 'test' and 'train' modules)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'train')))
+
 import matplotlib
 matplotlib.use('Agg')
-from test.inference_M import MyInferenceModel
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'train')))
+
+from inference_M import MyInferenceModel
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from einops import rearrange
-from test.sim_env import make_sim_env, BOX_POSE
-from test.visualize_episodes import save_videos
+from sim_env import make_sim_env, BOX_POSE
+from visualize_episodes import save_videos
 from train.mamba_policy import MambaPolicy, MambaConfig
 from train.scaler_M import Scaler
 from train.M_dataset import MambaSequenceDataset
@@ -72,8 +76,8 @@ def get_image(ts, camera_names):
     return curr_images
 
 
-scaler_path = '../train/scaler_params.pth'  # updated path, assuming it's in train/ or root if missing. wait, let me just change checkpoint
-checkpoint = '../train/lightning_logs/version_4/checkpoints/last.ckpt'  # updated path
+scaler_path = './train/scaler_params.pth'  # updated path, assuming it's in train/ or root if missing. wait, let me just change checkpoint
+checkpoint = './train/lightning_logs/version_4/checkpoints/last.ckpt'  # updated path
 results_dir = 'mtil.video'  # your own path
 if not os.path.exists(results_dir):
     os.makedirs(results_dir)
@@ -256,14 +260,26 @@ for r in range(env_max_reward + 1):
     summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate * 100}%\n'
 print(summary_str)
 print(f'성공률: {success_rate}, 평균 보상: {avg_return}')
-# # save success rate to txt
-# result_file_name = 'result_' + '.txt'
-# with open(os.path.join(results_dir, result_file_name), 'w') as f:
-#     f.write(summary_str)
-#     f.write(repr(episode_returns))
-#     f.write('\n\n')
-#     f.write(repr(highest_rewards))
-# print(f'성공률: {success_rate}, 평균 보상: {avg_return}')
+import csv
+from datetime import datetime
+
+# save success rate and metrics to CSV
+# we will append to the results file to track different checkpoints over time
+result_file_name = 'evaluation_results.csv'
+csv_path = os.path.join(results_dir, result_file_name)
+
+file_exists = os.path.exists(csv_path)
+with open(csv_path, 'a', newline='') as f:
+    writer = csv.writer(f)
+    if not file_exists:
+        # Write header if file is newly created
+        writer.writerow(['Timestamp', 'Checkpoint', 'Task Name', 'Rollouts', 'Success Rate', 'Average Return'])
+    
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    writer.writerow([timestamp, checkpoint, task_name, num_rollouts, success_rate, avg_return])
+
+print(f'\n[Result Saved] Success Rate: {success_rate:.2f}, Average Return: {avg_return:.2f}')
+print(f'-> Data appended to {csv_path}')
 
 
 

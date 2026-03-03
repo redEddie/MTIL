@@ -91,14 +91,13 @@ class MambaJEPA(nn.Module):
         B, T, C, H, W = images['top'].shape
         device = images['top'].device
 
-        patch_list = []
-        for t in range(T):
-            frame_patches = self.backbone(images['top'][:, t])
-            h_p, w_p = frame_patches.shape[-2], frame_patches.shape[-1]
-            N = h_p * w_p
-            frame_patches = rearrange(frame_patches, 'b c h w -> b 1 (h w) c')
-            patch_list.append(frame_patches)
-        patches = torch.cat(patch_list, dim=1)
+        flat_images = images['top'].flatten(0, 1) # [B*T, C, H, W]
+        frame_patches = self.backbone(flat_images)
+        h_p, w_p = frame_patches.shape[-2], frame_patches.shape[-1]
+        N = h_p * w_p
+        
+        # [B*T, 1024, h_p, w_p] -> [B, T, N, 1024]
+        patches = rearrange(frame_patches, '(b t) c h w -> b t (h w) c', b=B, t=T)
         tokens = self.patch_proj(patches)
 
         curr_pos_embed = self.pos_embed
@@ -120,24 +119,18 @@ class MambaJEPA(nn.Module):
         return z
 
     def forward(self, images):
-        # images['top']: [B, T, 3, 480, 640]
         B, T, C, H, W = images['top'].shape
         device = images['top'].device
         
-        # 1. 시각 특징 추출 (메모리 절약을 위해 프레임별 순차 처리 루프)
-        patch_list = []
+        # 1. 시각 특징 추출 (Batching 처리하여 GPU 병렬 효율 극대화)
         with torch.no_grad():
-            for t in range(T):
-                # 한 프레임씩 처리하여 중간 Activation 누적 방지
-                frame_patches = self.backbone(images['top'][:, t])
-                # [B, 1024, h_p, w_p] -> [B, 1, N, 1024]
-                h_p, w_p = frame_patches.shape[-2], frame_patches.shape[-1]
-                N = h_p * w_p
-                frame_patches = rearrange(frame_patches, 'b c h w -> b 1 (h w) c')
-                patch_list.append(frame_patches)
+            flat_images = images['top'].flatten(0, 1) # [B*T, C, H, W]
+            frame_patches = self.backbone(flat_images)
+            h_p, w_p = frame_patches.shape[-2], frame_patches.shape[-1]
+            N = h_p * w_p
             
-            # 모든 프레임 특징 결합: [B, T, N, 1024]
-            patches = torch.cat(patch_list, dim=1)
+            # [B*T, 1024, h_p, w_p] -> [B, T, N, 1024]
+            patches = rearrange(frame_patches, '(b t) c h w -> b t (h w) c', b=B, t=T)
         
         tokens = self.patch_proj(patches) # [B, T, N, D]
         

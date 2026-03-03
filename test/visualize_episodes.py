@@ -5,7 +5,7 @@ import h5py
 import argparse
 
 import matplotlib.pyplot as plt
-from test.constants import DT
+from constants import DT
 
 import IPython
 e = IPython.embed
