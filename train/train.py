@@ -424,14 +424,14 @@ def main():
 
     # 2) 构造 Dataset
     train_dataset = MambaSequenceDataset(
-        root_dir="/home/jeonchanwook/MTIL/transfer.100",  # put your own data path here
+        root_dir="/home/pilab/workspace/MTIL/transfer.50.1",  # put your own data path here
         mode="train",
         resize_hw=(640, 480),
         use_pose10d=True,
         selected_cameras=config.camera_names
     )
     val_dataset = MambaSequenceDataset(
-        root_dir="/home/jeonchanwook/MTIL/transfer.100",
+        root_dir="/home/pilab/workspace/MTIL/transfer.50.1",
         mode="test",
         resize_hw=(640, 480),
         use_pose10d=True,
@@ -454,7 +454,7 @@ def main():
 
     # 加载归一化参数
     scaler = Scaler(lowdim_dict=lowdim_dict)
-    scaler.load('scaler_params.pth')  # put your own scaler data path here
+    scaler.load('train/scaler_params.pth')  # put your own scaler data path here
 
     # Assign loaded scaler to train and val datasets
     train_dataset.scaler = scaler

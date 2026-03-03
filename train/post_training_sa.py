@@ -132,16 +132,36 @@ class LitPostTraiingSA(pl.LightningModule):
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"JEPA checkpoint not found: {ckpt_path}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        raw_sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        # Check if it's a DeepSpeed directory
+        if os.path.isdir(ckpt_path):
+            # Lightning ZeRO-2 saves actual weights in this sub-path
+            actual_ckpt_path = os.path.join(ckpt_path, "checkpoint", "mp_rank_00_model_states.pt")
+            if not os.path.exists(actual_ckpt_path):
+                raise FileNotFoundError(f"DeepSpeed model states not found at: {actual_ckpt_path}")
+            print(f"[post_traiing_sa] Detected DeepSpeed checkpoint directory. Loading from: {actual_ckpt_path}")
+            ckpt = torch.load(actual_ckpt_path, map_location="cpu", weights_only=False)
+            # DeepSpeed checkpoints might wrap the state dict differently
+            raw_sd = ckpt["module"] if "module" in ckpt else ckpt
+        else:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            raw_sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
 
         mapped_sd = {}
         for k, v in raw_sd.items():
             nk = k
+            # Strip deepspeed _forward_module or standard lightning prefix
+            if nk.startswith("_forward_module."):
+                nk = nk[len("_forward_module."):]
             if nk.startswith("model."):
                 nk = nk[len("model."):]
             if nk.startswith("jepa."):
                 nk = nk[len("jepa."):]
+            
+            # (추가) Pre-training의 max_t가 Post-training의 max_t보다 클 때 축소해서 받아오기
+            if nk == "time_embed" and v.shape != self.jepa.time_embed.shape:
+                print(f"[post_traiing_sa] Resizing time_embed from {v.shape} to {self.jepa.time_embed.shape}")
+                v = v[:, :self.jepa.time_embed.shape[1], :, :]
+                
             mapped_sd[nk] = v
 
         msg = self.jepa.load_state_dict(mapped_sd, strict=False)
@@ -242,7 +262,7 @@ def resolve_jepa_ckpt(user_path: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_path", type=str, default="/home/jeonchanwook/MTIL/transfer.50")
+    parser.add_argument("--root_path", type=str, default="/home/pilab/workspace/MTIL/transfer.50")
     parser.add_argument("--jepa_ckpt_path", type=str, default="")
     parser.add_argument("--max_epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=6)
@@ -261,7 +281,7 @@ def main():
     config.num_blocks = 4
     config.camera_names = ["top"]
     config.img_size = (640, 480)
-    config.max_t = 10  # 10 프레임 (2초 분량) 유지
+    config.max_t = 2  # 2 프레임 (4Hz 주기 사용시 0.5초 분량) 유지
 
     root_path = args.root_path
     if not os.path.exists(root_path):
@@ -272,7 +292,7 @@ def main():
     train_dataset = SAPostTraiingDataset(
         root_dir=root_path,
         mode="train",
-        history_frames=10,
+        history_frames=2,
         frame_skip=10,
         future_steps=16,
         selected_cameras=config.camera_names,
@@ -280,7 +300,7 @@ def main():
     val_dataset = SAPostTraiingDataset(
         root_dir=root_path,
         mode="test",
-        history_frames=10,
+        history_frames=2,
         frame_skip=10,
         future_steps=16,
         selected_cameras=config.camera_names,
@@ -333,7 +353,7 @@ def main():
         callbacks=[ckpt_cb],
         precision=args.precision,
         log_every_n_steps=1,
-        val_check_interval=1000,
+        check_val_every_n_epoch=1,
         limit_val_batches=50,  # 추가: 검증 시간을 대폭 줄이기 위해 50개 배치만 검증
     )
     trainer.fit(model, train_loader, val_loader)

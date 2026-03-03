@@ -54,7 +54,7 @@ config = MambaConfig()
 config.camera_names = ['top']
 config.img_size = (640, 480)
 config.num_blocks = 4
-config.max_t = 10 
+config.max_t = 2 
 
 policy_input_mode = "saz" # Make sure this matches how you trained it
 future_steps = 16
