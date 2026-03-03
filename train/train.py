@@ -495,10 +495,12 @@ def main():
 
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     ckpt_cb = ModelCheckpoint(monitor='val_epoch_loss', mode='min',
+                              dirpath="/home/pilab/workspace/MTIL/lightning_logs_mtil/checkpoints",
                               save_last=True,
                               save_top_k=5,  # 保存最好的x个检查点
-                              filename="{epoch}-{val_loss:.4f}",)
+                              filename="{epoch}-{val_epoch_loss:.4f}",)
     trainer = pl.Trainer(
+        default_root_dir="/home/pilab/workspace/MTIL/lightning_logs_mtil",
         accelerator='gpu',
         devices=[0],  # single GPU
         max_epochs=200,

@@ -1,0 +1,71 @@
+====== 미친 의존성 ======
+TREU/FALSE
+설치 후 causal-conv1d 호환검사 : python -c "import torch; print('ABI:', torch._C._GLIBCXX_USE_CXX11_ABI)"
+
+cu12torch2.6cxx11abiFALSE-cp310
+
+3.10 - 에서는 가장 낮은거
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post5/causal_conv1d-1.5.0.post5+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post5/causal_conv1d-1.5.0.post5+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+https://github.com/state-spaces/mamba/releases/download/v2.2.3/mamba_ssm-2.2.3+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/state-spaces/mamba/releases/download/v2.2.3/mamba_ssm-2.2.3+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+3.10 - 20.04에서는 컴파일러 버전 낮아서 에러 발생 함.
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+https://github.com/state-spaces/mamba/releases/download/v2.2.3.post2/mamba_ssm-2.2.3.post2+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+https://github.com/state-spaces/mamba/releases/download/v2.2.3.post2/mamba_ssm-2.2.3.post2+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+3.9
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post5/causal_conv1d-1.5.0.post5+cu12torch2.6cxx11abiFALSE-cp39-cp39-linux_x86_64.whl
+https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.0.post5/causal_conv1d-1.5.0.post5+cu12torch2.6cxx11abiFALSE-cp39-cp39-linux_x86_64.whl
+
+
+https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2+cu122torch2.4cxx11abiFALSE-cp39-cp39-linux_x86_64.whl
+https://github.com/state-spaces/mamba/releases/download/v2.2.2/mamba_ssm-2.2.2+cu122torch2.4cxx11abiFALSE-cp39-cp39-linux_x86_64.whl
+
+====== xformers ======
+pip install -U xformers --index-url https://download.pytorch.org/whl/cu124
+pip install -U xformers --index-url https://download.pytorch.org/whl/cu124
+pip install torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+
+========= MTIL ==========
+conda install -c conda-forge gxx_linux-64=11 sysroot_linux-64=2.28
+MTIL 평가 비디오 저장위치 mtil.video
+
+CUDA_VISIBLE_DEVICES=3 MUJOCO_GL=egl python train/train.py
+CUDA_VISIBLE_DEVICES=3 MUJOCO_GL=egl python test/evaluate_model_transfer.py
+
+========== JEPA ==========
+(DeepSpeed 멀티 GPU) JEPA pre training
+CUDA_VISIBLE_DEVICES=4,5,6,7 python train/train_jepa.py
+
+(DeepSpeed 멀티 GPU)
+CUDA_VISIBLE_DEVICES=4,5,6,7 python train/post_training_sa.py \
+    --policy_input_mode saz \
+    --batch_size 16 \
+    --devices 4 \
+    --jepa_ckpt_path "/Data/pilab/MTIL/lightning_logs/jepa_pretrain_final/version_8/checkpoints/epoch=4-step=2055.ckpt/"
+
+
+JEPA Evaluation
+cd /home/pilab/workspace/MTIL/test
+CUDA_VISIBLE_DEVICES=7 MUJOCO_GL=egl PYTHONPATH=/home/pilab/workspace/MTIL python evaluate_jepa_sa.py
+
+=========== 기타 ============
+
+CSV파일에서 원하는 열만 뽑아 자동으로 꺾은선 그래프를 저장
+python plot_metrics.py \
+  --csv_path train/lightning_logs/jepa_pretrain_final/version_2/metrics.csv \
+  --x_col step \
+  --y_col train_loss_step \
+  --save_path step_vs_loss.png
+
+
+python plot_metrics.py \
+  --csv_path train/lightning_logs/jepa_pretrain_final/version_2/metrics.csv \
+  --x_col epoch \
+  --y_col val_loss \
+  --save_path epoch_vs_val_loss.png
