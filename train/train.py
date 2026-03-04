@@ -24,6 +24,7 @@ class LitMambaModel(pl.LightningModule):
         # Register train and val sequence_loss as buffers
         self.train_sequence_loss = 0.0
         self.val_sequence_loss = 0.0
+        self.accumulated_loss = 0.0  # FBPTT loss accumulator
         # 1) 构建 MambaPolicy
         print("Starting training...")
         self.policy = MambaPolicy(
@@ -132,22 +133,26 @@ class LitMambaModel(pl.LightningModule):
         #         lowdim['gripper_pos2'] += torch.randn_like(lowdim['gripper_pos2']) * noise_scale_gripper2
         # # ========== (对 lowdim 加随机扰动) ==========
 
-        # 检测是否是新轨迹
+        # 새로운 궤적 시작 감지
         if traj_idx != self.prev_traj_idx and self.prev_traj_idx != -1:
-            # 执行优化步骤
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 梯度裁剪
-            optimizer.step()
-            optimizer.zero_grad()
-            # 记录累积的训练损失
+            # FBPTT: 전체 궤적에 대해 한 번에 역전파 수행
+            if isinstance(self.accumulated_loss, torch.Tensor):
+                self.manual_backward(self.accumulated_loss)
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 그레이디언트 클리핑
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            # 누적된 학습 손실 기록
             self.log("train_loss", self.train_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-            # 重置累积损失
+            # 누적 손실 초기화
             self.train_sequence_loss = 0.0
-            # 初始化新的轨迹隐状态
+            self.accumulated_loss = 0.0
+            # 새로운 궤적 히든 상태 초기화
             self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx  # 更新轨迹索引
+            self.prev_traj_idx = traj_idx  # 궤적 인덱스 업데이트
 
         elif self.prev_traj_idx == -1:
-            # 第一个轨迹，初始化隐藏状态
+            # 첫 번째 궤적, 히든 상태 초기화
             self.hiddens= self.policy.init_hidden_states(batch_size=1, device=self.device)
             self.prev_traj_idx = traj_idx
 
@@ -179,11 +184,12 @@ class LitMambaModel(pl.LightningModule):
         # 前向传播: 在 policy上 step
         pred_action, self.hiddens = self.policy.step(concat_lowdim, rgb, self.hiddens)
 
-        # 隐状态断开计算图
-        self.hiddens = [
-            ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
-            for (c, s) in self.hiddens
-        ]
+        # FBPTT: DO NOT detach hiddens during training
+        # self.hiddens = [
+        #     ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
+        #     for (c, s) in self.hiddens
+        # ]
+
         # 计算损失
         actions = torch.cat([
             lowdim['agl_1_act'],lowdim['agl_2_act'],lowdim['agl_3_act'],
@@ -195,8 +201,11 @@ class LitMambaModel(pl.LightningModule):
         ], dim=2)  # => [B,16,14]
         loss = F.mse_loss(pred_action, actions)
 
-        # 反向传播
-        self.manual_backward(loss)
+        # FBPTT: Accumulate loss tensor instead of calling manual_backward every step
+        if isinstance(self.accumulated_loss, torch.Tensor):
+            self.accumulated_loss += loss
+        else:
+            self.accumulated_loss = loss
 
         # 累积损失
         self.train_sequence_loss += loss.item()
@@ -272,16 +281,18 @@ class LitMambaModel(pl.LightningModule):
         return loss  # 返回当前步骤的损失
 
     def on_train_epoch_end(self):
-        optimizer = self.optimizers()  # 获取优化器
+        optimizer = self.optimizers()  # 옥티마이저 가져오기
 
-        # 处理最后一条轨迹的累积损失
-        if self.train_sequence_loss > 0.0:
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 梯度裁剪（可选）
+        # 마지막 궤적의 누적 손실 처리
+        if isinstance(self.accumulated_loss, torch.Tensor):
+            self.manual_backward(self.accumulated_loss)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 그레이디언트 클리핑
             optimizer.step()
             optimizer.zero_grad()
             self.log("train_loss", self.train_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-            self.train_sequence_loss = 0.0  # 重置累积损失
-            self.lr_scheduler_obj.step()  # 学习率调度器步进
+            self.train_sequence_loss = 0.0  # 누적 손실 초기화
+            self.accumulated_loss = 0.0
+            self.lr_scheduler_obj.step()  # 학습률 스케줄러 단계 진행
 
         self.log("train_epoch_loss",
                  self.train_total_loss / self.train_total_steps if self.train_total_steps > 0 else 0.0,
