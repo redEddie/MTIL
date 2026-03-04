@@ -29,7 +29,7 @@ class LitMambaModel(pl.LightningModule):
         self.policy = MambaPolicy(
             camera_names = config.camera_names,
             embed_dim = config.embed_dim,
-            lowdim_dim = config.lowdim,
+            lowdim_dim = config.lowdim_dim,
             d_model = config.d_model,
             action_dim = config.action_dim,   # pose_act(12) + gripper_act(2) = 14
             sum_camera_feats = config.sum_camera_feats,
@@ -384,14 +384,14 @@ def main():
 
     # 2) 构造 Dataset
     train_dataset = MambaSequenceDataset(
-        root_dir="data100",  # put your own data path here
+        root_dir="transfer.100",  # put your own data path here
         mode="train",
         resize_hw=(640, 480),
         use_pose10d=True,
         selected_cameras=config.camera_names
     )
     val_dataset = MambaSequenceDataset(
-        root_dir="data100",
+        root_dir="transfer.100",
         mode="test",
         resize_hw=(640, 480),
         use_pose10d=True,
