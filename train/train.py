@@ -79,14 +79,6 @@ class LitMambaModel(pl.LightningModule):
         lowdim = batch['lowdim']  # [B=1,D]
         traj_idx = batch['traj_idx'].item()  # 当前样本的轨迹索引
 
-        # ---------- 수정 사항 2: 메모리 프로파일링 로그 추가 ----------
-        if batch_idx % 10 == 0: # 10스텝마다 더 자주 로깅
-            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-            max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            self.log("mem/allocated_gb", allocated, prog_bar=True, on_step=True)
-            self.log("mem/peak_gb", max_allocated, prog_bar=True, on_step=True)
-        # -------------------------------------------------------
-
         # ==========  (optional, 对 lowdim 加随机扰动) ==========
         noise_agl = 0.02  # ~ 1 mm
         noise_gripper = 0.02
