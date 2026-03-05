@@ -542,45 +542,18 @@ class MambaPolicy(nn.Module):
         if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
-        # 初始化DINOv2特征提取器
-        self.shared_backbone = FrozenDinov2(layer_index=-4)
+        # 初始化DINOv2特征提取器 (마지막 레이어 사용, 1D 토큰 반환)
+        self.shared_backbone = FrozenDinov2(layer_index=23)
 
-        # 添加空间压缩层（保持合理分辨率）
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(dinov2_dim, 512, 3, padding=1), #[B, 512, 45, 34]
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1), #[B, 256, 45, 34]
-            nn.ReLU(),
-            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),  # 输出 [B,128,22,17]
-            nn.Flatten(1), # [B, 128*(H*W)],输入为（640，480）时为（B, 128*23*18=52992）
-            nn.Linear(128*23*18, self.embed_dim),  # [B, embed_dim]
-            nn.LayerNorm(2048),
+        # Spatial Scan을 위한 Mamba 블록 (비전 맘바 역할)
+        # 패치 토큰 차원(1024)을 Mamba d_model에 맞추기 위한 프로젝션
+        self.token_proj = nn.Sequential(
+            nn.Linear(dinov2_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.10)
         )
-        self.spatial_adpater_low = nn.Sequential(
-            nn.Conv2d(dinov2_dim, 512, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.Flatten(1),  # [B, 128*(H*W)],输入为（128，128）时为（B, 128*8*8=8192）
-            nn.Linear(128*8*8, self.embed_dim),  # [B, embed_dim],输入为（640，480）
-        )
-        # 输入特征的拼接和投影
-        # self.in_dim = embed_dim + lowdim_dim
-        self.cross_attn = CrossModalAttention(d_model)
-        self.in_dim = embed_dim * len(self.camera_names)
-        # 跨相机交叉注意力模块
-        self.num_cameras = len(camera_names)
-        if self.num_cameras > 1:
-            self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
-        self.in_proj = nn.Linear(self.in_dim, d_model)
-
-        # Block 配置
-        if block_cfg is None:
-            block_cfg = {}
-
+        
         # Mamba2 配置
         def mixer_fn(dim):
             return Mamba2(
@@ -606,7 +579,30 @@ class MambaPolicy(nn.Module):
                 nn.GELU(),
                 nn.Linear(hidden_dim, dim),
             )
-        # 构建多个 Block
+
+        # Spatial Mamba Block: 공간 패치(L=1530)를 순차적으로 스캔
+        self.spatial_mamba = Block(
+            dim=self.embed_dim,
+            mixer_cls=mixer_fn,
+            mlp_cls=mlp_fn,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=block_cfg.get("fused_add_norm", False) if block_cfg else False,
+            residual_in_fp32=block_cfg.get("residual_in_fp32", False) if block_cfg else False,
+        )
+        # 입력 특징 연결 및 투영
+        self.cross_attn = CrossModalAttention(d_model)
+        self.in_dim = embed_dim * len(self.camera_names)
+        # 카메라 간 교차 어텐션
+        self.num_cameras = len(camera_names)
+        if self.num_cameras > 1:
+            self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
+        self.in_proj = nn.Linear(self.in_dim, d_model)
+
+        # Block 配置
+        if block_cfg is None:
+            block_cfg = {}
+
+        # 구축할 Temporal Mamba Blocks (기존 시간 차원 블록)
         self.blocks = nn.ModuleList([
             Block(
                 dim=self.d_model,
@@ -651,17 +647,23 @@ class MambaPolicy(nn.Module):
         B, _ = lowdim_t.shape
         device = lowdim_t.device
 
-        # 1. 多相机特征提取
-
+        # 1. 다중 카메라 특징 추출 (Spatial Scan)
         feats_all = []
         for cam in self.camera_names:
             img = images_t[cam]
-            raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
-            # 空间压缩与通道调整
-            if self.img_size == (640, 480):
-                feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
-            elif self.img_size == (128, 128):
-                feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+            raw_tokens = self.shared_backbone(img)  # [B, N_patches, 1024]
+            
+            # 차원 맞추기: [B, N_patches, embed_dim]
+            spatial_seq = self.token_proj(raw_tokens)
+            
+            # 여기서 공간 시퀀스를 맘바로 스캔 (L=N_patches)
+            # forward 함수를 사용하여 병렬 스캔 적용
+            spatial_out, _ = self.spatial_mamba(spatial_seq, residual=None)
+            
+            # 전체 그림의 정보를 요약하기 위해 마지막 토큰 사용 (또는 전체 평균)
+            # 여기서는 시간적 순서가 없으므로 평균(Avg Pooling)을 취하여 전체 특성 대표
+            feat = spatial_out.mean(dim=1)  # [B, embed_dim]
+            
             feats_all.append(feat)
 
         cam_feats = torch.cat(feats_all, dim=1)
