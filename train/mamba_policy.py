@@ -487,6 +487,10 @@ class FrozenDinov2(nn.Module):
         return TF.resize(img, (new_H, new_W), antialias=True)
 
     def forward(self, x):
+        # 5D 텐서 (B, T, C, H, W) 가 들어오는 경우 (T=1) 4D로 스퀴즈
+        if x.dim() == 5: # [2, 1, 3, 480, 640]
+            x = x.squeeze(1)
+            
         # 动态调整尺寸（保证最小分辨率）
         x = self.adaptive_resize(x)
         B, C, H, W = x.shape
@@ -497,12 +501,9 @@ class FrozenDinov2(nn.Module):
         # 获取中间层特征（shape: [B, num_patches, dim]）
         features = self.intermediate_output
 
-        # 重组为2D特征图
-        H_patch = H // self.patch_size
-        W_patch = W // self.patch_size
-        features = features[:, 1:, :]  # 去除CLS token
-        features = features.permute(0, 2, 1).view(B, -1, H_patch, W_patch)
-        return features  # [B, dim, H_patch, W_patch]
+        # CLS 토큰 제거하고 패치 토큰들만 1D 시퀀스로 반환
+        features = features[:, 1:, :]  # Shape: [B, num_patches-1, dim]
+        return features  # [B, N, dim]
 
 #########################################
 # 2) MambaPolicy (多相机 + lowdim -> Mamba2 -> action)
@@ -542,11 +543,11 @@ class MambaPolicy(nn.Module):
         if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
-        # 初始化DINOv2特征提取器 (마지막 레이어 사용, 1D 토큰 반환)
+        # DINOv2 특징 추출기 초기화 (마지막 레이어 사용, 1D 토큰 반환)
         self.shared_backbone = FrozenDinov2(layer_index=23)
 
-        # Spatial Scan을 위한 Mamba 블록 (비전 맘바 역할)
-        # 패치 토큰 차원(1024)을 Mamba d_model에 맞추기 위한 프로젝션
+        # 공간적 스캔(Spatial Scan)을 수행하기 위한 비전 맘바 전용 프로젝션 레이어
+        # DINOv2 패치 토큰 차원(1024)을 맘바 모델의 차원(embed_dim)에 맞추어 변환
         self.token_proj = nn.Sequential(
             nn.Linear(dinov2_dim, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
@@ -636,32 +637,37 @@ class MambaPolicy(nn.Module):
 
     def step(self, lowdim_t, images_t, hidden_states):
         """
-        单帧前向:
-          lowdim_t: [B, lowdim_dim]
-          images_t: dict of [B, 3, H, W] => 单帧输入
-          hidden_states: list of (conv_st, ssm_st) per block，每个 Block 的隐藏状态
-        返回:
-          pred_action: [B, action_dim]
-          new_hidden_states: List[Tensor]
+        단일 프레임(Single Frame) 전방향 예측:
+          lowdim_t: [B, lowdim_dim] -> 로봇 상태 데이터 (시간 축 없음)
+          images_t: dict of [B, 3, H, W] -> 카메라별 단일 프레임 이미지 입력
+          hidden_states: list of (conv_st, ssm_st) per block -> 각 Mamba 블록의 이전 은닉 상태(과거 기억)
+        반환:
+          pred_action: [B, action_dim] -> 현재 프레임에 대한 행동 예측
+          new_hidden_states: List[Tensor] -> 다음 프레임으로 전달될 업데이트된 은닉 상태
         """
         B, _ = lowdim_t.shape
         device = lowdim_t.device
 
-        # 1. 다중 카메라 특징 추출 (Spatial Scan)
+        # 1. 다중 카메라 특징 추출 (공간적 스캔 - Spatial Scan)
         feats_all = []
         for cam in self.camera_names:
             img = images_t[cam]
-            raw_tokens = self.shared_backbone(img)  # [B, N_patches, 1024]
+            raw_tokens = self.shared_backbone(img)  # DINOv2 출력 [B, N_patches, 1024]
             
-            # 차원 맞추기: [B, N_patches, embed_dim]
-            spatial_seq = self.token_proj(raw_tokens)
+            # 1D 토큰 차원 맞추기: [B, N_patches, embed_dim]
+            # PyTorch Linear는 3D tensor를 받을 수 있지만, Sequential 내부의 LayerNorm 등으로 인해 꼬일 수 있음
+            # 확실하게 reshape 하여 통과시킨 후 다시 돌려놓음
+            B_cam, N_patches, dim = raw_tokens.shape
+            raw_tokens_flat = raw_tokens.reshape(B_cam * N_patches, dim)
+            spatial_seq_flat = self.token_proj(raw_tokens_flat)
+            spatial_seq = spatial_seq_flat.reshape(B_cam, N_patches, self.embed_dim)
             
-            # 여기서 공간 시퀀스를 맘바로 스캔 (L=N_patches)
-            # forward 함수를 사용하여 병렬 스캔 적용
+            # Mamba를 이용해 공간 시퀀스 스캔 (시퀀스 길이 L = N_patches)
+            # 여기서는 Mamba의 원래 기능(병렬 스캔)을 활용하여 이미지 패치들을 분석
             spatial_out, _ = self.spatial_mamba(spatial_seq, residual=None)
             
-            # 전체 그림의 정보를 요약하기 위해 마지막 토큰 사용 (또는 전체 평균)
-            # 여기서는 시간적 순서가 없으므로 평균(Avg Pooling)을 취하여 전체 특성 대표
+            # 전체 이미지 특징을 요약하기 위해 출력 토큰들의 평균을 계산 (Average Pooling)
+            # 공간 패치에는 순환적인 시간 순서가 큰 의미가 없으므로 전체 평균이 강건한 특징을 제공함
             feat = spatial_out.mean(dim=1)  # [B, embed_dim]
             
             feats_all.append(feat)
