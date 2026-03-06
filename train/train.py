@@ -453,6 +453,7 @@ def main():
         accelerator='gpu',
         devices=[0],  # single GPU
         max_epochs=200,
+        default_root_dir="./logs/spatial_scan",
         callbacks=[lr_monitor, ckpt_cb],
         precision=32
     )
