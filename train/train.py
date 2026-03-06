@@ -19,7 +19,7 @@ class LitMambaModel(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["scaler"])
         self.metric = my_Metric()
-        self.prev_traj_idx = -1  # 初始化上一个轨迹索引
+        self.prev_traj_idx = -1  # 궤적 경계 감지용
         self.future_steps = future_steps
         # Register train and val sequence_loss as buffers
         self.train_sequence_loss = 0.0
@@ -136,27 +136,21 @@ class LitMambaModel(pl.LightningModule):
         #         lowdim['gripper_pos2'] += torch.randn_like(lowdim['gripper_pos2']) * noise_scale_gripper2
         # # ========== (对 lowdim 加随机扰动) ==========
 
-        # 새로운 궤적 시작 감지
+        # 새로운 궤적 시작 감지 (로그 기록용)
         if traj_idx != self.prev_traj_idx and self.prev_traj_idx != -1:
-            # FBPTT: 전체 궤적에 대해 한 번에 역전파 수행
+            # FBPTT: 궤적 단위 역전파
             if isinstance(self.accumulated_loss, torch.Tensor):
                 self.manual_backward(self.accumulated_loss)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 그레이디언트 클리핑
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-            
-            # 누적된 학습 손실 기록
+
             self.log("train_loss", self.train_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-            # 누적 손실 초기화
             self.train_sequence_loss = 0.0
             self.accumulated_loss = 0.0
-            # 새로운 궤적 히든 상태 초기화
-            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx  # 궤적 인덱스 업데이트
+            self.prev_traj_idx = traj_idx
 
         elif self.prev_traj_idx == -1:
-            # 첫 번째 궤적, 히든 상태 초기화
-            self.hiddens= self.policy.init_hidden_states(batch_size=1, device=self.device)
             self.prev_traj_idx = traj_idx
 
         # 数据预处理
@@ -184,14 +178,8 @@ class LitMambaModel(pl.LightningModule):
         concat_lowdim = torch.cat([agl_1_arm,agl_2_arm,agl_3_arm,agl_4_arm,agl_5_arm,agl_6_arm,gripper_arm1,
                                    agl2_1_arm,agl2_2_arm,agl2_3_arm,agl2_4_arm,agl2_5_arm,agl2_6_arm,gripper_arm2], dim=1)
 
-        # 前向传播: 在 policy上 step
-        pred_action, self.hiddens = self.policy.step(concat_lowdim, rgb, self.hiddens)
-
-        # TBPTT: Detach hiddens so gradients don't flow infinitely through time
-        self.hiddens = [
-            ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
-            for (c, s) in self.hiddens
-        ]
+        # 전방향 예측: Spatial Scan
+        pred_action = self.policy.step(concat_lowdim, rgb)
 
         # 计算损失
         actions = torch.cat([
@@ -223,25 +211,7 @@ class LitMambaModel(pl.LightningModule):
 
         return loss  # 返回当前步骤的损失
 
-    def on_train_batch_start(self, batch, batch_idx):
-        # 检查是否切换了轨迹片段或者是一个新的批次
-        # Assuming self.trainer.datamodule.train_dataset is the MambaSequenceDataset
-        # and it has a cum_lengths attribute.
-        # If not, this logic needs to be adapted to how traj_idx is determined.
-        # For now, using the batch['traj_idx'] directly as it's available in training_step.
-        traj_idx = batch['traj_idx'].item()
-
-        # 새로운 궤적이 시작될 때만 hiddens 강제 초기화
-        # (TBPTT를 사용하더라도 하나의 궤적 안에서는 hiddens가 이어짐)
-        if traj_idx != self.current_traj_idx:
-            # print(f"--- New Trajectory started (idx={traj_idx}) ---")
-
-            # 은닉 상태 초기화
-            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.current_traj_idx = traj_idx
-
-            # 궤적 누적 로스 초기화
-            self.train_sequence_loss = 0.0
+    # on_train_batch_start 제거: 순수 spatial scan에서는 hidden state 관리 불필요
 
     def validation_step(self, batch, batch_idx):
 
@@ -249,16 +219,12 @@ class LitMambaModel(pl.LightningModule):
         lowdim = batch['lowdim']  # [B=1,D]
         traj_idx = batch['traj_idx'].item()  # 当前样本的轨迹索引
 
-        # 检测是否是新轨迹
+        # 궤적 경계 감지 (로그 기록용)
         if traj_idx != self.prev_traj_idx:
             if self.prev_traj_idx != -1 and self.val_sequence_loss > 0.0:
-                # 记录验证损失
                 self.log("val_loss", self.val_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-                # 重置累积损失
                 self.val_sequence_loss = 0.0
-            # 初始化新的隐藏状态
-            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx  # 更新轨迹索引
+            self.prev_traj_idx = traj_idx
 
         # 数据预处理
         for cam in rgb:
@@ -273,12 +239,7 @@ class LitMambaModel(pl.LightningModule):
                                    lowdim['agl2_1'], lowdim['agl2_2'], lowdim['agl2_3'], lowdim['agl2_4'],
                                    lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']], dim=1)
 
-        pred_action, self.hiddens= self.policy.step(concat_lowdim, rgb, self.hiddens)
-
-        self.hiddens = [
-            ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
-            for (c, s) in self.hiddens
-        ]
+        pred_action = self.policy.step(concat_lowdim, rgb)
 
         actions = torch.cat([
             lowdim['agl_1_act'],lowdim['agl_2_act'],lowdim['agl_3_act'],

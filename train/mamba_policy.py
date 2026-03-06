@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -488,33 +489,65 @@ class FrozenDinov2(nn.Module):
 
     def forward(self, x):
         # 5D 텐서 (B, T, C, H, W) 가 들어오는 경우 (T=1) 4D로 스퀴즈
-        if x.dim() == 5: # [2, 1, 3, 480, 640]
+        if x.dim() == 5:
             x = x.squeeze(1)
-            
-        # 动态调整尺寸（保证最小分辨率）
+
+        # 동적 리사이즈 (patch_size 배수로 맞춤)
         x = self.adaptive_resize(x)
         B, C, H, W = x.shape
+        H_patch = H // self.patch_size
+        W_patch = W // self.patch_size
 
-        # 前向传播获取中间层特征
-        _ = self.dino(x)  # 触发前向钩子
-
-        # 获取中间层特征（shape: [B, num_patches, dim]）
+        # DINOv2 forward → hook으로 중간층 특징 획득
+        _ = self.dino(x)
         features = self.intermediate_output
 
-        # CLS 토큰 제거하고 패치 토큰들만 1D 시퀀스로 반환
-        features = features[:, 1:, :]  # Shape: [B, num_patches-1, dim]
-        return features  # [B, N, dim]
+        # CLS 토큰 제거, 패치 토큰만 반환
+        features = features[:, 1:, :]  # [B, H_patch*W_patch, dim]
+        return features, H_patch, W_patch
 
 #########################################
-# 2) MambaPolicy (多相机 + lowdim -> Mamba2 -> action)
+# 2) 2D SinCos Positional Embedding
+#########################################
+
+def get_2d_sincos_pos_embed(embed_dim, h, w):
+    """
+    고정 2D sincos 위치 임베딩 생성.
+    embed_dim: 출력 차원
+    h, w: 패치 그리드의 높이, 너비
+    반환: [h*w, embed_dim] numpy array
+    """
+    assert embed_dim % 2 == 0
+    grid_h = np.arange(h, dtype=np.float32)
+    grid_w = np.arange(w, dtype=np.float32)
+    grid_w, grid_h = np.meshgrid(grid_w, grid_h)  # 각각 [h, w]
+
+    emb_h = _get_1d_sincos(embed_dim // 2, grid_h.reshape(-1))  # [h*w, D/2]
+    emb_w = _get_1d_sincos(embed_dim // 2, grid_w.reshape(-1))  # [h*w, D/2]
+    return np.concatenate([emb_h, emb_w], axis=1)  # [h*w, D]
+
+
+def _get_1d_sincos(embed_dim, positions):
+    """1D sincos: positions [M] → [M, embed_dim]"""
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega  # [D/2]
+    out = np.einsum('m,d->md', positions.astype(np.float64), omega)  # [M, D/2]
+    return np.concatenate([np.sin(out), np.cos(out)], axis=1)  # [M, D]
+
+
+#########################################
+# 3) MambaPolicy (Pure Spatial Scan)
 #########################################
 import torch
-# import torch.nn as nn
 from torchvision import models
 
 class MambaPolicy(nn.Module):
     """
-    多相机 + lowdim -> backbone -> concat/sum -> in_proj -> Block (with Mamba2) -> action
+    Pure Spatial Scan:
+      DINOv2 패치 + lowdim action token → spatial Mamba → action chunk
+      시간 기억 없음, 매 프레임 독립 처리
     """
     def __init__(
         self,
@@ -524,11 +557,11 @@ class MambaPolicy(nn.Module):
         lowdim_dim=14,
         d_model=2048,
         action_dim=14,
-        num_blocks=4,  # 支持多个 Block
-        sum_camera_feats=False,  # sum or concat
-        block_cfg=None,  # Block 的配置
-        mamba_cfg=None,  # Mamba2 的配置
-        future_steps=16,  # 预测未来16步，可调
+        num_blocks=4,
+        sum_camera_feats=False,
+        block_cfg=None,
+        mamba_cfg=None,
+        future_steps=16,
     ):
         super().__init__()
         self.camera_names = camera_names
@@ -539,23 +572,36 @@ class MambaPolicy(nn.Module):
         self.d_model = d_model
         self.action_dim = action_dim
         self.sum_camera_feats = sum_camera_feats
-        dinov2_dim = 1024  # dinov2_vitl14的dim=1024
+        dinov2_dim = 1024  # dinov2_vitl14 출력 차원
         if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
         # DINOv2 특징 추출기 초기화 (마지막 레이어 사용, 1D 토큰 반환)
         self.shared_backbone = FrozenDinov2(layer_index=23)
 
-        # 공간적 스캔(Spatial Scan)을 수행하기 위한 비전 맘바 전용 프로젝션 레이어
-        # DINOv2 패치 토큰 차원(1024)을 맘바 모델의 차원(embed_dim)에 맞추어 변환
+        # 패치 토큰 투영: DINOv2 dim(1024) → embed_dim(2048)
         self.token_proj = nn.Sequential(
             nn.Linear(dinov2_dim, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.10)
         )
-        
-        # Mamba2 配置
+
+        # lowdim → action token 투영: 14 → embed_dim(2048)
+        self.lowdim_proj = nn.Sequential(
+            nn.Linear(lowdim_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 512),
+            nn.Dropout(0.1),
+            nn.Linear(512, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        )
+
+        # 2D sincos 위치 임베딩 캐시
+        self._cached_pos_embed = None
+        self._cached_pos_shape = None
+
+        # Mamba2 설정
         def mixer_fn(dim):
             return Mamba2(
                 d_model=dim,
@@ -581,32 +627,12 @@ class MambaPolicy(nn.Module):
                 nn.Linear(hidden_dim, dim),
             )
 
-        # Spatial Mamba Block: 공간 패치(L=1530)를 순차적으로 스캔
-        self.spatial_mamba = Block(
-            dim=self.embed_dim,
-            mixer_cls=mixer_fn,
-            mlp_cls=mlp_fn,
-            norm_cls=nn.LayerNorm,
-            fused_add_norm=block_cfg.get("fused_add_norm", False) if block_cfg else False,
-            residual_in_fp32=block_cfg.get("residual_in_fp32", False) if block_cfg else False,
-        )
-        # 입력 특징 연결 및 투영
-        self.cross_attn = CrossModalAttention(d_model)
-        self.in_dim = embed_dim * len(self.camera_names)
-        # 카메라 간 교차 어텐션
-        self.num_cameras = len(camera_names)
-        if self.num_cameras > 1:
-            self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
-        self.in_proj = nn.Linear(self.in_dim, d_model)
-
-        # Block 配置
+        # Spatial Mamba Blocks: num_blocks(4)개 블록으로 패치 시퀀스 스캔
         if block_cfg is None:
             block_cfg = {}
-
-        # 구축할 Temporal Mamba Blocks (기존 시간 차원 블록)
-        self.blocks = nn.ModuleList([
+        self.spatial_blocks = nn.ModuleList([
             Block(
-                dim=self.d_model,
+                dim=self.embed_dim,
                 mixer_cls=mixer_fn,
                 mlp_cls=mlp_fn,
                 norm_cls=nn.LayerNorm,
@@ -616,160 +642,94 @@ class MambaPolicy(nn.Module):
             for _ in range(num_blocks)
         ])
 
+        # 멀티 카메라 지원
+        self.num_cameras = len(camera_names)
+        self.in_dim = embed_dim * self.num_cameras
+        if self.num_cameras > 1:
+            self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
+        self.in_proj = nn.Linear(self.in_dim, d_model)
+
+        # Action 출력: d_model → future_steps * action_dim
         self.flat_action_dim = action_dim * future_steps
         self.out_proj = nn.Linear(d_model, self.flat_action_dim)
 
 
-    def init_hidden_states(self, batch_size, device=None):
-        """
-        For single-step inference: gather each block's Mamba2 => allocate_inference_cache
-        """
-        if device is None:
-            device = next(self.parameters()).device
-        hidden_list = []
-        for blk in self.blocks:
-            if hasattr(blk.mixer, "allocate_inference_cache"):
-                conv_st, ssm_st = blk.mixer.allocate_inference_cache(batch_size, max_seqlen=1, dtype=None)
-            else:
-                conv_st, ssm_st = None, None
-            hidden_list.append((conv_st, ssm_st))
-        return hidden_list
+    def _get_pos_embed(self, h_patches, w_patches, device, dtype):
+        """2D sincos 위치 임베딩 가져오기 (캐시 지원)"""
+        shape = (h_patches, w_patches)
+        if self._cached_pos_embed is None or self._cached_pos_shape != shape:
+            pe = get_2d_sincos_pos_embed(self.embed_dim, h_patches, w_patches)
+            self._cached_pos_embed = torch.from_numpy(pe).to(device=device, dtype=dtype)
+            self._cached_pos_shape = shape
+        return self._cached_pos_embed  # [h*w, embed_dim]
 
-    def step(self, lowdim_t, images_t, hidden_states):
+    def step(self, lowdim_t, images_t):
         """
-        단일 프레임(Single Frame) 전방향 예측:
-          lowdim_t: [B, lowdim_dim] -> 로봇 상태 데이터 (시간 축 없음)
-          images_t: dict of [B, 3, H, W] -> 카메라별 단일 프레임 이미지 입력
-          hidden_states: list of (conv_st, ssm_st) per block -> 각 Mamba 블록의 이전 은닉 상태(과거 기억)
+        순수 Spatial Scan (프레임 독립):
+          lowdim_t: [B, lowdim_dim] → 로봇 상태
+          images_t: dict of [B, 3, H, W] → 카메라별 단일 프레임
         반환:
-          pred_action: [B, action_dim] -> 현재 프레임에 대한 행동 예측
-          new_hidden_states: List[Tensor] -> 다음 프레임으로 전달될 업데이트된 은닉 상태
+          pred_action: [B, future_steps, action_dim]
         """
         B, _ = lowdim_t.shape
         device = lowdim_t.device
 
-        # 1. 다중 카메라 특징 추출 (공간적 스캔 - Spatial Scan)
+        # === 1. Spatial Scan: 패치 + action token → Mamba ===
         feats_all = []
         for cam in self.camera_names:
             img = images_t[cam]
-            raw_tokens = self.shared_backbone(img)  # DINOv2 출력 [B, N_patches, 1024]
-            
-            # 1D 토큰 차원 맞추기: [B, N_patches, embed_dim]
-            # PyTorch Linear는 3D tensor를 받을 수 있지만, Sequential 내부의 LayerNorm 등으로 인해 꼬일 수 있음
-            # 확실하게 reshape 하여 통과시킨 후 다시 돌려놓음
-            B_cam, N_patches, dim = raw_tokens.shape
-            raw_tokens_flat = raw_tokens.reshape(B_cam * N_patches, dim)
-            spatial_seq_flat = self.token_proj(raw_tokens_flat)
-            spatial_seq = spatial_seq_flat.reshape(B_cam, N_patches, self.embed_dim)
-            
-            # Mamba를 이용해 공간 시퀀스 스캔 (시퀀스 길이 L = N_patches)
-            # 여기서는 Mamba의 원래 기능(병렬 스캔)을 활용하여 이미지 패치들을 분석
-            spatial_out, _ = self.spatial_mamba(spatial_seq, residual=None)
-            
-            # 전체 이미지 특징을 요약하기 위해 출력 토큰들의 평균을 계산 (Average Pooling)
-            # 공간 패치에는 순환적인 시간 순서가 큰 의미가 없으므로 전체 평균이 강건한 특징을 제공함
-            feat = spatial_out.mean(dim=1)  # [B, embed_dim]
-            
+            raw_tokens, h_p, w_p = self.shared_backbone(img)  # [B, N, 1024]
+
+            # 패치 투영 + 2D sincos PE
+            patch_tokens = self.token_proj(raw_tokens)  # [B, N, embed_dim]
+            pos_embed = self._get_pos_embed(h_p, w_p, device, patch_tokens.dtype)
+            patch_tokens = patch_tokens + pos_embed.unsqueeze(0)
+
+            # lowdim → action token
+            action_token = self.lowdim_proj(lowdim_t).unsqueeze(1)  # [B, 1, embed_dim]
+
+            # 패치 + action token → Spatial Mamba 스캔
+            spatial_input = torch.cat([patch_tokens, action_token], dim=1)  # [B, N+1, embed_dim]
+            # Spatial Mamba 스캔 (4개 블록 순차 통과)
+            residual = None
+            hidden = spatial_input
+            for blk in self.spatial_blocks:
+                hidden, residual = blk(hidden, residual)
+
+            # 마지막 토큰(action token 위치) 추출
+            feat = hidden[:, -1, :]  # [B, embed_dim]
             feats_all.append(feat)
 
-        cam_feats = torch.cat(feats_all, dim=1)
-        # 跨相机注意力
+        # === 2. 멀티 카메라 융합 ===
+        cam_feats = torch.cat(feats_all, dim=1)  # [B, embed_dim * N_cams]
         if self.num_cameras > 1:
-            cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
-                                            cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
+            cam_feats = self.cross_cam_attn(
+                cam_feats.unsqueeze(1), cam_feats.unsqueeze(1),
+                cam_feats.unsqueeze(1)
+            ).squeeze(1)
 
-        # 2. 特征融合与投影
-        lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
-        # 投影到d_model并交叉注意力
-        cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
-        fused_feat = self.cross_attn(
-            query=cam_feats_proj.unsqueeze(1),
-            key=lowdim_feat,
-            value=lowdim_feat
-        ).squeeze(1)
-        x_t = fused_feat # [B, d_model]
+        x = self.in_proj(cam_feats)  # [B, d_model]
 
-        # 3) 经过 blocks (单步)
-        residual = None
-        new_states = []
-        hidden = x_t
-        for i, blk in enumerate(self.blocks):
-            conv_st, ssm_st = hidden_states[i] if i < len(hidden_states) else (None, None)
-            if residual is None:
-                residual = hidden
-            else:
-                residual = residual + hidden
+        # === 3. Action 출력 ===
+        action_flat = self.out_proj(x)  # [B, future_steps * action_dim]
+        action_t = action_flat.view(-1, self.future_steps, self.action_dim)
+        return action_t
 
-            hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
-
-            # => step
-            # we need: out, new_conv, new_ssm = blk.mixer.step(...)
-            if hasattr(blk.mixer, "step"):
-                y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln.unsqueeze(1), conv_st, ssm_st)
-                y_t = y_t.squeeze(1)   # => (B, d_model)
-            else:
-                # fallback
-                y_t = blk.mixer(hidden_ln.unsqueeze(1))
-                y_t = y_t.squeeze(1)
-                new_conv_st, new_ssm_st = conv_st, ssm_st
-
-            hidden_out = y_t + residual
-
-            # mlp
-            if blk.mlp is not None:
-                r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
-                hidden_out = blk.mlp(r2) + hidden_out
-
-            new_states.append((new_conv_st, new_ssm_st))
-            hidden = hidden_out
-            residual = hidden_out
-
-            # d) out => action
-        action_flat = self.out_proj(hidden)# => [B, 16×14=224]
-        action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
-        return action_t, new_states
-
-# forward一般不使用
     def forward(self, lowdim, images):
         """
+        전체 시퀀스 처리 (각 프레임 독립 Spatial Scan).
         lowdim: [B, L, lowdim_dim]
-        images: dict of [B, L, 3, H, W]
-        返回: [B, L, action_dim]
+        images: dict of {cam_name: [B, L, 3, H, W]}
+        반환: [B, L, future_steps, action_dim]
         """
-        device = lowdim.device
         B, L, _ = lowdim.shape
 
-        # 1. 多相机特征提取
-        feats_all = []
-        for cam in self.camera_names:
-            if cam not in images:
-                feats_all.append(torch.zeros(B, L, self.embed_dim, device=device))
-                continue
-            x = images[cam]
-            x = x.view(B * L, *x.shape[2:])
-            net = self.backbones[cam]
-            feats = net(x)  # [B*L,512,15,20]
-            projected_feat = self.feature_extractors(feats)
-            projected_feat = projected_feat.view(B, L, -1)
-            feats_all.append(projected_feat)
+        all_actions = []
+        for t in range(L):
+            lowdim_t = lowdim[:, t]  # [B, lowdim_dim]
+            images_t = {cam: images[cam][:, t] for cam in self.camera_names}
+            action_t = self.step(lowdim_t, images_t)  # [B, future_steps, action_dim]
+            all_actions.append(action_t)
 
-        if self.sum_camera_feats:
-            cam_feats = torch.stack(feats_all, dim=0).sum(dim=0)
-        else:
-            cam_feats = torch.cat(feats_all, dim=2)
-
-        # 2. 特征拼接与投影
-        x = torch.cat([cam_feats, lowdim], dim=2)
-        x = self.in_proj(x)
-
-        # 3. 逐层通过 Block
-        residual = None
-        for blk in self.blocks:
-            x, residual = blk(x, residual)
-
-        # 4. 输出动作
-        actions = self.out_proj(x)
-        actions = actions.view(B, L, self.future_steps, self.action_dim)
+        actions = torch.stack(all_actions, dim=1)  # [B, L, future_steps, action_dim]
         return actions
-
-
