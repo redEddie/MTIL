@@ -359,6 +359,7 @@ class LitMambaModel(pl.LightningModule):
 
 #  main
 def main():
+    TASK="insertion20"
     seed_everything(42)
 
     # 1)  config
@@ -375,14 +376,14 @@ def main():
 
     # 2) 构造 Dataset
     train_dataset = MambaSequenceDataset(
-        root_dir="transfer.100",  # put your own data path here
+        root_dir=f"dataset/{TASK}",  # put your own data path here
         mode="train",
         resize_hw=(640, 480),
         use_pose10d=True,
         selected_cameras=config.camera_names
     )
     val_dataset = MambaSequenceDataset(
-        root_dir="transfer.100",
+        root_dir=f"dataset/{TASK}",
         mode="test",
         resize_hw=(640, 480),
         use_pose10d=True,
@@ -453,7 +454,7 @@ def main():
         accelerator='gpu',
         devices=[0],  # single GPU
         max_epochs=200,
-        default_root_dir="./logs/spatial_scan",
+        default_root_dir=f"./logs/spatial_scan/{TASK}",
         callbacks=[lr_monitor, ckpt_cb],
         precision=32
     )
