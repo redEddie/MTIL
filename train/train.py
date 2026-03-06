@@ -192,10 +192,11 @@ class LitMambaModel(pl.LightningModule):
         ], dim=2)  # => [B,16,14]
         loss = F.mse_loss(pred_action, actions)
 
-        # TBPTT: 매 스텝마다 역전파 수행
+        # 매 스텝 역전파
         opt = self.optimizers()
         opt.zero_grad()
         self.manual_backward(loss)
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
         opt.step()
 
         # 累积损失
