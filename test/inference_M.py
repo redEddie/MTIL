@@ -7,6 +7,11 @@ import numpy as np
 
 from train.scaler_M import Scaler
 from train.mamba_policy import MambaPolicy, MambaConfig
+import train.mamba_policy as _mamba_policy_module                                              
+import train.scaler_M as _scaler_module                                                        
+# checkpoint가 'mamba_policy', 'scaler_M' 모듈명으로 저장된 경우 대응                          
+sys.modules.setdefault('mamba_policy', _mamba_policy_module)                                   
+sys.modules.setdefault('scaler_M', _scaler_module)   
 
 
 class MyInferenceModel(nn.Module):
@@ -46,10 +51,10 @@ class MyInferenceModel(nn.Module):
         print("[MyInferenceModel]  Policy created.")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.scaler = Scaler(lowdim_dict=lowdim_dict)
-        self.scaler.load(scaler_pth)
+        self.scaler.load(scaler_path)
         self.policy.to(self.device)
         print(f"[MyInferenceModel] Loading checkpoint from {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location='cuda:0')
+        ckpt = torch.load(checkpoint_path, map_location='cuda:0', weights_only=False)
         state_dict = ckpt['state_dict']
 
         # 键名替换（移除所有'policy.'前缀）

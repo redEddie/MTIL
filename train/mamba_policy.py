@@ -721,6 +721,76 @@ class MambaPolicy(nn.Module):
         action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
         return action_t, new_states
 
+    def forward_seq(self, lowdim_seq, images_seq):
+        """
+        시퀀스 병렬 forward (학습 고속화용).
+          lowdim_seq : [B, L, lowdim_dim]
+          images_seq : {cam: [B, L, C, H, W]}
+        반환:
+          actions    : [B, L, future_steps, action_dim]
+
+        DINOv2를 [B*L, C, H, W]로 한 번에 처리하고
+        Mamba 블록을 forward([B, L, D]) 모드로 병렬 실행한다.
+        """
+        B, L, _ = lowdim_seq.shape
+
+        # 1. 멀티-카메라 특징 추출: [B*L, C, H, W] 일괄 처리
+        feats_all = []
+        for cam in self.camera_names:
+            img = images_seq[cam]                            # [B, L, C, H, W]
+            img_flat = img.reshape(B * L, *img.shape[2:])   # [B*L, C, H, W]
+            raw_feat = self.shared_backbone(img_flat)        # [B*L, 1024, H_p, W_p]
+            if self.img_size == (640, 480):
+                feat = self.spatial_adapter(raw_feat)        # [B*L, embed_dim]
+            elif self.img_size == (128, 128):
+                feat = self.spatial_adpater_low(raw_feat)
+            feats_all.append(feat)
+
+        cam_feats = torch.cat(feats_all, dim=1)              # [B*L, embed_dim*num_cams]
+
+        if self.num_cameras > 1:
+            cam_feats = self.cross_cam_attn(
+                cam_feats.unsqueeze(1), cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)
+            ).squeeze(1)
+
+        # 2. in_proj + cross-modal attention (프레임별 독립)
+        cam_feats_proj = self.in_proj(cam_feats)             # [B*L, d_model]
+        lowdim_flat = lowdim_seq.reshape(B * L, 1, self.lowdim_dim)  # [B*L, 1, 14]
+
+        fused = self.cross_attn(
+            query=cam_feats_proj.unsqueeze(1),               # [B*L, 1, d_model]
+            key=lowdim_flat,
+            value=lowdim_flat
+        ).squeeze(1)                                         # [B*L, d_model]
+
+        x = fused.reshape(B, L, self.d_model)               # [B, L, d_model]
+
+        # 3. Mamba 블록 forward 모드: [B, L, D] 병렬 처리
+        residual = None
+        hidden = x
+        for blk in self.blocks:
+            if residual is None:
+                residual = hidden
+            else:
+                residual = residual + hidden
+
+            hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
+            # forward() -> Triton 병렬 prefix-scan (step()과 달리 L차원 전체를 한번에)
+            y = blk.mixer(hidden_ln)                         # [B, L, d_model]
+            hidden_out = y + residual
+
+            if blk.mlp is not None:
+                r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
+                hidden_out = blk.mlp(r2) + hidden_out
+
+            hidden = hidden_out
+            residual = hidden_out
+
+        # 4. 출력 투영
+        action_flat = self.out_proj(hidden)                  # [B, L, future_steps*action_dim]
+        actions = action_flat.view(B, L, self.future_steps, self.action_dim)
+        return actions
+
 # forward一般不使用
     def forward(self, lowdim, images):
         """

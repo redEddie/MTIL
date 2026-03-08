@@ -73,203 +73,122 @@ class LitMambaModel(pl.LightningModule):
 
 
     def training_step(self, batch, batch_idx):
-        optimizer = self.optimizers()  # 获取优化器
+        optimizer = self.optimizers()
 
-        rgb = batch['rgb']  # [B=1,C,H,W]
-        lowdim = batch['lowdim']  # [B=1,D]
-        traj_idx = batch['traj_idx'].item()  # 当前样本的轨迹索引
+        # chunk 기반 batch: rgb [B,L,C,H,W], lowdim 상태 [B,L,1], 액션 [B,L,F,1]
+        rgb = batch['rgb']
+        lowdim = batch['lowdim']
+        traj_idx = batch['traj_idx'].item()
+        is_first_chunk = batch['is_first_chunk'].item()
 
-        # ==========  (optional, 对 lowdim 加随机扰动) ==========
-        noise_agl = 0.02  # ~ 1 mm
-        noise_gripper = 0.02
-        noise_scale_agl_1 = noise_agl * self.std_agl_1
-        noise_scale_agl_2 = noise_agl * self.std_agl_2
-        noise_scale_agl_3 = noise_agl * self.std_agl_3
-        noise_scale_agl_4 = noise_agl * self.std_agl_4
-        noise_scale_agl_5 = noise_agl * self.std_agl_5
-        noise_scale_agl_6 = noise_agl * self.std_agl_6
-        noise_scale_agl2_1 = noise_agl * self.std_agl2_1
-        noise_scale_agl2_2 = noise_agl * self.std_agl2_2
-        noise_scale_agl2_3 = noise_agl * self.std_agl2_3
-        noise_scale_agl2_4 = noise_agl * self.std_agl2_4
-        noise_scale_agl2_5 = noise_agl * self.std_agl2_5
-        noise_scale_agl2_6 = noise_agl * self.std_agl2_6
-        noise_scale_gripper = noise_gripper * self.std_grip1
-        noise_scale_gripper2 = noise_gripper * self.std_grip2
-        # noise_scale_gripper1 = 0.3 * self.std_grip1
-        # noise_scale_gripper2 = 0.3 * self.std_grip2
-        # 仅在训练中加扰动, validation不加
-        with torch.no_grad():
-            # pose(9): x,y,z, rx,ry,rz, ...
-            if 'agl_1' in lowdim:
-                lowdim['agl_1'] += torch.randn_like(lowdim['agl_1']) * noise_scale_agl_1
-            if 'agl_2' in lowdim:
-                lowdim['agl_2'] += torch.randn_like(lowdim['agl_2']) * noise_scale_agl_2
-            if 'agl_3' in lowdim:
-                lowdim['agl_3'] += torch.randn_like(lowdim['agl_3']) * noise_scale_agl_3
-            if 'agl_4' in lowdim:
-                lowdim['agl_4'] += torch.randn_like(lowdim['agl_4']) * noise_scale_agl_4
-            if 'agl_5' in lowdim:
-                lowdim['agl_5'] += torch.randn_like(lowdim['agl_5']) * noise_scale_agl_5
-            if 'agl_6' in lowdim:
-                lowdim['agl_6'] += torch.randn_like(lowdim['agl_6']) * noise_scale_agl_6
-            if 'agl2_1' in lowdim:
-                lowdim['agl2_1'] += torch.randn_like(lowdim['agl2_1']) * noise_scale_agl2_1
-            if 'agl2_2' in lowdim:
-                lowdim['agl2_2'] += torch.randn_like(lowdim['agl2_2']) * noise_scale_agl2_2
-            if 'agl2_3' in lowdim:
-                lowdim['agl2_3'] += torch.randn_like(lowdim['agl2_3']) * noise_scale_agl2_3
-            if 'agl2_4' in lowdim:
-                lowdim['agl2_4'] += torch.randn_like(lowdim['agl2_4']) * noise_scale_agl2_4
-            if 'agl2_5' in lowdim:
-                lowdim['agl2_5'] += torch.randn_like(lowdim['agl2_5']) * noise_scale_agl2_5
-            if 'agl2_6' in lowdim:
-                lowdim['agl2_6'] += torch.randn_like(lowdim['agl2_6']) * noise_scale_agl2_6
-
-        #     if 'gripper_pos' in lowdim:
-        #         lowdim['gripper_pos'] += torch.randn_like(lowdim['gripper_pos']) * noise_scale_gripper
-        #     if 'gripper_pos2' in lowdim:
-        #         lowdim['gripper_pos2'] += torch.randn_like(lowdim['gripper_pos2']) * noise_scale_gripper2
-        # # ========== (对 lowdim 加随机扰动) ==========
-
-        # 检测是否是新轨迹
-        if traj_idx != self.prev_traj_idx and self.prev_traj_idx != -1:
-            # 执行优化步骤
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)  # 梯度裁剪
+        # 새 trajectory 시작 -> 이전 trajectory gradient 적용
+        if is_first_chunk and self.prev_traj_idx != -1:
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
-            # 记录累积的训练损失
-            self.log("train_loss", self.train_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-            # 重置累积损失
             self.train_sequence_loss = 0.0
-            # 初始化新的轨迹隐状态
-            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx  # 更新轨迹索引
 
-        elif self.prev_traj_idx == -1:
-            # 第一个轨迹，初始化隐藏状态
-            self.hiddens= self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx
+        self.prev_traj_idx = traj_idx
 
-        # 数据预处理
-        for cam in rgb:
-            x = rgb[cam]  # shape [B, C, H, W]
-            rgb[cam] = x
+        # noise augmentation: randn_like 는 임의 shape에 동작
+        noise_agl = 0.02
+        with torch.no_grad():
+            for key, scale in [
+                ('agl_1', noise_agl * self.std_agl_1), ('agl_2', noise_agl * self.std_agl_2),
+                ('agl_3', noise_agl * self.std_agl_3), ('agl_4', noise_agl * self.std_agl_4),
+                ('agl_5', noise_agl * self.std_agl_5), ('agl_6', noise_agl * self.std_agl_6),
+                ('agl2_1', noise_agl * self.std_agl2_1), ('agl2_2', noise_agl * self.std_agl2_2),
+                ('agl2_3', noise_agl * self.std_agl2_3), ('agl2_4', noise_agl * self.std_agl2_4),
+                ('agl2_5', noise_agl * self.std_agl2_5), ('agl2_6', noise_agl * self.std_agl2_6),
+            ]:
+                if key in lowdim:
+                    lowdim[key] = lowdim[key] + torch.randn_like(lowdim[key]) * scale
 
-        # lowdim归一化
+        # lowdim 정규화
         lowdim = self.scaler.normalize(lowdim)
 
-        agl_1_arm = lowdim['agl_1']
-        agl_2_arm = lowdim['agl_2']
-        agl_3_arm = lowdim['agl_3']
-        agl_4_arm = lowdim['agl_4']
-        agl_5_arm = lowdim['agl_5']
-        agl_6_arm = lowdim['agl_6']
-        gripper_arm1 = lowdim['gripper_pos']
-        agl2_1_arm = lowdim['agl2_1']
-        agl2_2_arm = lowdim['agl2_2']
-        agl2_3_arm = lowdim['agl2_3']
-        agl2_4_arm = lowdim['agl2_4']
-        agl2_5_arm = lowdim['agl2_5']
-        agl2_6_arm = lowdim['agl2_6']
-        gripper_arm2 = lowdim['gripper_pos2']
-        concat_lowdim = torch.cat([agl_1_arm,agl_2_arm,agl_3_arm,agl_4_arm,agl_5_arm,agl_6_arm,gripper_arm1,
-                                   agl2_1_arm,agl2_2_arm,agl2_3_arm,agl2_4_arm,agl2_5_arm,agl2_6_arm,gripper_arm2], dim=1)
+        # concat_lowdim: [B, L, 14]  (dim=2 로 concat)
+        concat_lowdim = torch.cat([
+            lowdim['agl_1'], lowdim['agl_2'], lowdim['agl_3'], lowdim['agl_4'],
+            lowdim['agl_5'], lowdim['agl_6'], lowdim['gripper_pos'],
+            lowdim['agl2_1'], lowdim['agl2_2'], lowdim['agl2_3'], lowdim['agl2_4'],
+            lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']
+        ], dim=2)  # [B, L, 14]
 
-        # 前向传播: 在 policy上 step
-        pred_action, self.hiddens = self.policy.step(concat_lowdim, rgb, self.hiddens)
+        # forward_seq: DINOv2 [B*L,...] 일괄처리 + Mamba forward([B,L,D])
+        pred_action = self.policy.forward_seq(concat_lowdim, rgb)  # [B, L, future_steps, 14]
 
-        # 隐状态断开计算图
-        self.hiddens = [
-            ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
-            for (c, s) in self.hiddens
-        ]
-        # 计算损失
+        # target actions: [B, L, future_steps, 14]  (dim=3 로 concat)
         actions = torch.cat([
-            lowdim['agl_1_act'],lowdim['agl_2_act'],lowdim['agl_3_act'],
-            lowdim['agl_4_act'],lowdim['agl_5_act'],lowdim['agl_6_act'],
+            lowdim['agl_1_act'], lowdim['agl_2_act'], lowdim['agl_3_act'],
+            lowdim['agl_4_act'], lowdim['agl_5_act'], lowdim['agl_6_act'],
             lowdim['gripper_act'],
-            lowdim['agl2_1_act'],lowdim['agl2_2_act'],lowdim['agl2_3_act'],
-            lowdim['agl2_4_act'],lowdim['agl2_5_act'],lowdim['agl2_6_act'],
+            lowdim['agl2_1_act'], lowdim['agl2_2_act'], lowdim['agl2_3_act'],
+            lowdim['agl2_4_act'], lowdim['agl2_5_act'], lowdim['agl2_6_act'],
             lowdim['gripper_act2']
-        ], dim=2)  # => [B,16,14]
-        loss = F.mse_loss(pred_action, actions)
+        ], dim=3)  # [B, L, future_steps, 14]
 
-        # 反向传播
+        loss = F.mse_loss(pred_action, actions)
         self.manual_backward(loss)
 
-        # 累积损失
         self.train_sequence_loss += loss.item()
+        self.train_total_loss += loss.item()
+        self.train_total_steps += 1
 
-        #  累积 epoch 级损失
-        self.train_total_loss += loss.item()  # 整个 epoch 的损失总和
-        self.train_total_steps += 1  # 整个 epoch 的总步数
+        # 매 스텝마다 현재 chunk 손실 기록
+        self.log("train_loss", loss.item(), prog_bar=True, on_step=True, on_epoch=False,
+                 sync_dist=False, batch_size=1)
 
-        # 可选：清理缓存
         if batch_idx % 1000 == 0:
             torch.cuda.empty_cache()
 
-        return loss  # 返回当前步骤的损失
+        return loss
 
     def validation_step(self, batch, batch_idx):
+        rgb = batch['rgb']
+        lowdim = batch['lowdim']
+        traj_idx = batch['traj_idx'].item()
+        is_first_chunk = batch['is_first_chunk'].item()
 
-        rgb = batch['rgb']  # [B=1,C,H,W]
-        lowdim = batch['lowdim']  # [B=1,D]
-        traj_idx = batch['traj_idx'].item()  # 当前样本的轨迹索引
+        if is_first_chunk and self.prev_traj_idx != -1 and self.val_sequence_loss > 0.0:
+            self.log("val_loss", self.val_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
+            self.val_sequence_loss = 0.0
 
-        # 检测是否是新轨迹
-        if traj_idx != self.prev_traj_idx:
-            if self.prev_traj_idx != -1 and self.val_sequence_loss > 0.0:
-                # 记录验证损失
-                self.log("val_loss", self.val_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-                # 重置累积损失
-                self.val_sequence_loss = 0.0
-            # 初始化新的隐藏状态
-            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
-            self.prev_traj_idx = traj_idx  # 更新轨迹索引
+        self.prev_traj_idx = traj_idx
 
-        # 数据预处理
-        for cam in rgb:
-            x = rgb[cam]  # shape [B, C, H, W]
-            rgb[cam] = x
-
-        # lowdim归一化
         lowdim = self.scaler.normalize(lowdim)
 
-        concat_lowdim = torch.cat([lowdim['agl_1'],lowdim['agl_2'],lowdim['agl_3'],lowdim['agl_4'],
-                                 lowdim['agl_5'],lowdim['agl_6'],lowdim['gripper_pos'],
-                                   lowdim['agl2_1'], lowdim['agl2_2'], lowdim['agl2_3'], lowdim['agl2_4'],
-                                   lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']], dim=1)
+        # concat_lowdim: [B, L, 14]
+        concat_lowdim = torch.cat([
+            lowdim['agl_1'], lowdim['agl_2'], lowdim['agl_3'], lowdim['agl_4'],
+            lowdim['agl_5'], lowdim['agl_6'], lowdim['gripper_pos'],
+            lowdim['agl2_1'], lowdim['agl2_2'], lowdim['agl2_3'], lowdim['agl2_4'],
+            lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']
+        ], dim=2)  # [B, L, 14]
 
-        pred_action, self.hiddens= self.policy.step(concat_lowdim, rgb, self.hiddens)
+        pred_action = self.policy.forward_seq(concat_lowdim, rgb)  # [B, L, future_steps, 14]
 
-        self.hiddens = [
-            ((c.detach() if c is not None else None), (s.detach() if s is not None else None))
-            for (c, s) in self.hiddens
-        ]
-
+        # target: [B, L, future_steps, 14]
         actions = torch.cat([
-            lowdim['agl_1_act'],lowdim['agl_2_act'],lowdim['agl_3_act'],
-            lowdim['agl_4_act'],lowdim['agl_5_act'],lowdim['agl_6_act'],
+            lowdim['agl_1_act'], lowdim['agl_2_act'], lowdim['agl_3_act'],
+            lowdim['agl_4_act'], lowdim['agl_5_act'], lowdim['agl_6_act'],
             lowdim['gripper_act'],
-            lowdim['agl2_1_act'],lowdim['agl2_2_act'],lowdim['agl2_3_act'],
-            lowdim['agl2_4_act'],lowdim['agl2_5_act'],lowdim['agl2_6_act'],
+            lowdim['agl2_1_act'], lowdim['agl2_2_act'], lowdim['agl2_3_act'],
+            lowdim['agl2_4_act'], lowdim['agl2_5_act'], lowdim['agl2_6_act'],
             lowdim['gripper_act2']
-        ], dim=2)
+        ], dim=3)  # [B, L, future_steps, 14]
+
         loss = F.mse_loss(pred_action, actions)
 
-        # 累积验证损失
         self.val_sequence_loss += loss.item()
         self.val_total_loss += loss.item()
         self.val_total_steps += 1
 
-        # 反归一化动作，用于计算真实差距
         pred_action = self.denormalize(pred_action)
         actions = self.denormalize(actions)
-
         self.metric.update(pred_action, actions)
 
-        return loss  # 返回当前步骤的损失
+        return loss
 
     def on_train_epoch_end(self):
         optimizer = self.optimizers()  # 获取优化器
@@ -312,7 +231,7 @@ class LitMambaModel(pl.LightningModule):
             arm2_denorm['agl2_1_act'],arm2_denorm['agl2_2_act'],arm2_denorm['agl2_3_act'],
             arm2_denorm['agl2_4_act'],arm2_denorm['agl2_5_act'],arm2_denorm['agl2_6_act'],
             arm2_denorm['gripper_act2']
-        ], dim=2)
+        ], dim=-1)  # [..., future_steps, 14] - 마지막 차원으로 concat
         return out
 
      # cosine 优化器，平滑降低学习率
@@ -369,6 +288,11 @@ class LitMambaModel(pl.LightningModule):
 #  main
 def main():
     TASK="transfer20"
+    CHUNK_SIZE = 100  # L: 한 번에 처리할 연속 프레임 수 (클수록 빠르나 VRAM 더 필요)
+    # resume할 체크포인트 경로 (없으면 None으로 설정)
+    # RESUME_CKPT = None
+    RESUME_CKPT = "logs/main/transfer20/lightning_logs/version_5/checkpoints/last.ckpt"
+
     seed_everything(42)
 
     # 1)  config
@@ -389,14 +313,16 @@ def main():
         mode="train",
         resize_hw=(640, 480),
         use_pose10d=True,
-        selected_cameras=config.camera_names
+        selected_cameras=config.camera_names,
+        chunk_size=CHUNK_SIZE
     )
     val_dataset = MambaSequenceDataset(
         root_dir=f"dataset/{TASK}",
         mode="test",
         resize_hw=(640, 480),
         use_pose10d=True,
-        selected_cameras=config.camera_names
+        selected_cameras=config.camera_names,
+        chunk_size=CHUNK_SIZE
     )
 
     # 3) Initialize and fit the scaler
@@ -447,13 +373,16 @@ def main():
 
     # 5) 构造LightningModule
     lit_model = LitMambaModel(config, scaler=scaler)
-    # checkpoint_path = ('last.ckpt')  # put your own ckpt path here
-    # checkpoint = torch.load(checkpoint_path)
-    # lit_model.load_state_dict(checkpoint['state_dict'], strict=True)
 
     # 6) trainer
     from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+    from pytorch_lightning.loggers import CSVLogger
 
+    csv_logger = CSVLogger(
+        save_dir=f"./logs/main/{TASK}",
+        name="lightning_logs",        # 기본 PL 폴더명과 동일 → version이 이어짐
+        flush_logs_every_n_steps=1,   # 매 스텝마다 디스크에 flush
+    )
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     ckpt_cb = ModelCheckpoint(monitor='val_epoch_loss', mode='min',
                               save_last=True,
@@ -464,12 +393,17 @@ def main():
         devices=[0],  # single GPU
         max_epochs=200,
         default_root_dir=f"./logs/main/{TASK}",
+        logger=csv_logger,
+        log_every_n_steps=1,          # 매 스텝마다 metrics 기록
         callbacks=[lr_monitor, ckpt_cb],
         precision=32
     )
 
     # 7) fit
-    trainer.fit(lit_model, train_loader, val_loader)
+    # PyTorch 2.6+: weights_only=True가 기본값이라 커스텀 클래스 역직렬화 실패 방지
+    import torch.serialization
+    torch.serialization.add_safe_globals([MambaConfig])
+    trainer.fit(lit_model, train_loader, val_loader, ckpt_path=RESUME_CKPT)
 
     # done
 

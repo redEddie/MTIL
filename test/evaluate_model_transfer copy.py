@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.dirname(__file__))                   # test/
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # MTIL.main/ 
 from inference_M import MyInferenceModel
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 from einops import rearrange
 from sim_env import make_sim_env, BOX_POSE
@@ -134,15 +135,27 @@ for rollout_id in range(num_rollouts):
     # 增加FIFO加权动作队列
     all_time_actions = torch.zeros([max_timesteps, max_timesteps + num_queries, state_dim]).cuda()
     ts = env.reset()
+    # onscreen render
+    ax = plt.subplot()
+    plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+    plt.ion()
     infer_model.reset_hiddens()
     image_list = []  # for visualization
     qpos_list = []
     target_qpos_list = []
     rewards = []
-    temporal_agg = True
+    temporal_agg = True  # 是否使用时间聚合
+    # 增加渲染
+    ax = plt.subplot()
+    plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+    plt.ion()
 
     with torch.inference_mode():
         for t in range(max_timesteps):
+            # update onscreen render and wait for DT
+            image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
+            plt_img.set_data(image)
+            plt.pause(DT)
             # process previous timestep to get qpos and image_list
             obs = ts.observation
             if 'images' in obs:
@@ -214,6 +227,7 @@ for rollout_id in range(num_rollouts):
             qpos_list.append(qpos_numpy)
             target_qpos_list.append(target_qpos)
             rewards.append(ts.reward)
+        plt.close()
         pass
     rewards = np.array(rewards)
     episode_return = np.sum(rewards[rewards is not None])
