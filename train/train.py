@@ -81,12 +81,19 @@ class LitMambaModel(pl.LightningModule):
         traj_idx = batch['traj_idx'].item()
         is_first_chunk = batch['is_first_chunk'].item()
 
-        # 새 trajectory 시작 -> 이전 trajectory gradient 적용
-        if is_first_chunk and self.prev_traj_idx != -1:
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-            self.train_sequence_loss = 0.0
+        # 새 trajectory 시작: gradient 적용 + hidden state 리셋
+        if is_first_chunk:
+            if self.prev_traj_idx != -1:
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                self.train_sequence_loss = 0.0
+            # 새 궤적의 hidden state를 zeros로 초기화
+            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
+
+        # 첫 번째 배치 (hiddens 미초기화 방어)
+        if not hasattr(self, 'hiddens'):
+            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
 
         self.prev_traj_idx = traj_idx
 
@@ -115,8 +122,15 @@ class LitMambaModel(pl.LightningModule):
             lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']
         ], dim=2)  # [B, L, 14]
 
-        # forward_seq: DINOv2 [B*L,...] 일괄처리 + Mamba forward([B,L,D])
-        pred_action = self.policy.forward_seq(concat_lowdim, rgb)  # [B, L, future_steps, 14]
+        # forward_seq: DINOv2 병렬 + Mamba hidden state 전달
+        pred_action, self.hiddens = self.policy.forward_seq(concat_lowdim, rgb, self.hiddens)
+
+        # 청크 간 gradient 그래프 끊기 (값은 유지 → 궤적 기억 보존)
+        self.hiddens = [
+            (c.detach() if c is not None else None,
+             s.detach() if s is not None else None)
+            for (c, s) in self.hiddens
+        ]
 
         # target actions: [B, L, future_steps, 14]  (dim=3 로 concat)
         actions = torch.cat([
@@ -150,9 +164,14 @@ class LitMambaModel(pl.LightningModule):
         traj_idx = batch['traj_idx'].item()
         is_first_chunk = batch['is_first_chunk'].item()
 
-        if is_first_chunk and self.prev_traj_idx != -1 and self.val_sequence_loss > 0.0:
-            self.log("val_loss", self.val_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
-            self.val_sequence_loss = 0.0
+        if is_first_chunk:
+            if self.prev_traj_idx != -1 and self.val_sequence_loss > 0.0:
+                self.log("val_loss", self.val_sequence_loss, prog_bar=True, sync_dist=False, batch_size=1)
+                self.val_sequence_loss = 0.0
+            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
+
+        if not hasattr(self, 'hiddens'):
+            self.hiddens = self.policy.init_hidden_states(batch_size=1, device=self.device)
 
         self.prev_traj_idx = traj_idx
 
@@ -166,7 +185,12 @@ class LitMambaModel(pl.LightningModule):
             lowdim['agl2_5'], lowdim['agl2_6'], lowdim['gripper_pos2']
         ], dim=2)  # [B, L, 14]
 
-        pred_action = self.policy.forward_seq(concat_lowdim, rgb)  # [B, L, future_steps, 14]
+        pred_action, self.hiddens = self.policy.forward_seq(concat_lowdim, rgb, self.hiddens)
+        self.hiddens = [
+            (c.detach() if c is not None else None,
+             s.detach() if s is not None else None)
+            for (c, s) in self.hiddens
+        ]
 
         # target: [B, L, future_steps, 14]
         actions = torch.cat([

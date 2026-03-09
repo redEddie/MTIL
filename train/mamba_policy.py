@@ -721,75 +721,194 @@ class MambaPolicy(nn.Module):
         action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
         return action_t, new_states
 
-    def forward_seq(self, lowdim_seq, images_seq):
+    def _mamba2_block_forward(self, mixer, hidden_ln, conv_state, ssm_state):
         """
-        시퀀스 병렬 forward (학습 고속화용).
-          lowdim_seq : [B, L, lowdim_dim]
-          images_seq : {cam: [B, L, C, H, W]}
-        반환:
-          actions    : [B, L, future_steps, action_dim]
+        Mamba2 블록 하나를 알고리즘적으로 forward.
+        conv_state와 ssm_state를 받아 청크 경계를 가로질러 기억을 유지한다.
 
-        DINOv2를 [B*L, C, H, W]로 한 번에 처리하고
-        Mamba 블록을 forward([B, L, D]) 모드로 병렬 실행한다.
+        Args:
+            mixer     : Mamba2 인스턴스
+            hidden_ln : [B, L, d_model]  (pre-norm 이후 입력)
+            conv_state: [B, conv_dim, d_conv] or None  (이전 청크의 conv 슬라이딩 윈도우)
+            ssm_state : [B, nheads, headdim, d_state] or None  (이전 청크의 SSM 상태)
+        Returns:
+            out           : [B, L, d_model]
+            new_conv_state: [B, conv_dim, d_conv]
+            new_ssm_state : [B, nheads, headdim, d_state]
+        """
+        B, L, _ = hidden_ln.shape
+        dtype = hidden_ln.dtype
+
+        # ── 1. in_proj ────────────────────────────────────────────────────────
+        zxbcdt = mixer.in_proj(hidden_ln)   # [B, L, d_in_proj]
+        d_mlp = (zxbcdt.shape[-1]
+                 - 2 * mixer.d_ssm
+                 - 2 * mixer.ngroups * mixer.d_state
+                 - mixer.nheads) // 2
+        z0, x0, z, xBC, dt = torch.split(
+            zxbcdt,
+            [d_mlp, d_mlp, mixer.d_ssm,
+             mixer.d_ssm + 2 * mixer.ngroups * mixer.d_state,
+             mixer.nheads],
+            dim=-1
+        )
+        # d_mlp=0 이 일반적이므로 z0, x0 는 비어있음
+
+        # ── 2. causal conv1d (conv_state로 청크 경계 연속 처리) ───────────────
+        conv_dim = mixer.d_ssm + 2 * mixer.ngroups * mixer.d_state
+        d_conv   = mixer.d_conv
+        xBC_t    = xBC.transpose(1, 2)   # [B, conv_dim, L]
+
+        if conv_state is not None:
+            # 이전 청크의 마지막 d_conv-1 값을 앞에 이어붙임
+            prefix     = conv_state[:, :, -(d_conv - 1):]          # [B, conv_dim, d_conv-1]
+            xBC_padded = torch.cat([prefix, xBC_t], dim=-1)        # [B, conv_dim, d_conv-1+L]
+        else:
+            xBC_padded = F.pad(xBC_t, (d_conv - 1, 0))             # zero pad (첫 청크)
+
+        # padding 없이 conv1d 적용 (이미 수동으로 padding했으므로)
+        xBC_conv = F.conv1d(xBC_padded, mixer.conv1d.weight,
+                            mixer.conv1d.bias, groups=conv_dim)     # [B, conv_dim, L]
+        xBC_act  = F.silu(xBC_conv).transpose(1, 2)                # [B, L, conv_dim]
+
+        # 다음 청크를 위한 새 conv_state: 현재 청크 raw xBC의 마지막 d_conv 값
+        prev = conv_state if conv_state is not None \
+               else xBC_t.new_zeros(B, conv_dim, 0)
+        new_conv_state = torch.cat([prev, xBC_t], dim=-1)[:, :, -d_conv:]  # [B, conv_dim, d_conv]
+
+        # ── 3. xBC_act 분리 ───────────────────────────────────────────────────
+        x_ssm, B_ssm, C_ssm = torch.split(
+            xBC_act,
+            [mixer.d_ssm,
+             mixer.ngroups * mixer.d_state,
+             mixer.ngroups * mixer.d_state],
+            dim=-1
+        )
+
+        # ── 4. dt 이산화 ──────────────────────────────────────────────────────
+        dt_disc = F.softplus(dt + mixer.dt_bias.to(dtype=dt.dtype))  # [B, L, nheads]
+        A       = -torch.exp(mixer.A_log.float())                     # [nheads]
+        x_ssm_r = rearrange(x_ssm, "b l (h p) -> b l h p", p=mixer.headdim)  # [B, L, nheads, headdim]
+
+        # ── 5. SSM sequential loop (알고리즘 검증 버전) ───────────────────────
+        if ssm_state is not None:
+            h = ssm_state.float().clone()
+        else:
+            h = torch.zeros(B, mixer.nheads, mixer.headdim, mixer.d_state,
+                            device=hidden_ln.device, dtype=torch.float32)
+
+        ys = []
+        for t in range(L):
+            dt_t = dt_disc[:, t, :].float()          # [B, nheads]
+            x_t  = x_ssm_r[:, t, :, :].float()      # [B, nheads, headdim]
+            B_t  = B_ssm[:, t, :].float()            # [B, ngroups*d_state]
+            C_t  = C_ssm[:, t, :].float()            # [B, ngroups*d_state]
+
+            dA  = torch.exp(dt_t * A)                # [B, nheads]
+            dBx = torch.einsum("bh,bn,bhp->bhpn", dt_t, B_t, x_t)  # [B, nheads, headdim, d_state]
+            h   = h * rearrange(dA, "b h -> b h 1 1") + dBx
+
+            y_t = torch.einsum("bhpn,bn->bhp", h, C_t)
+            y_t = y_t + rearrange(mixer.D.float(), "h -> h 1") * x_t
+            ys.append(rearrange(y_t, "b h p -> b (h p)").to(dtype))
+
+        y             = torch.stack(ys, dim=1)   # [B, L, d_ssm]
+        new_ssm_state = h.to(dtype)
+
+        # ── 6. RMSNorm + gate z ───────────────────────────────────────────────
+        if mixer.rmsnorm:
+            y = mixer.norm(y, z)
+        else:
+            y = y * F.silu(z)
+
+        # ── 7. out_proj ───────────────────────────────────────────────────────
+        out = mixer.out_proj(y)   # [B, L, d_model]
+
+        return out, new_conv_state, new_ssm_state
+
+    def forward_seq(self, lowdim_seq, images_seq, hidden_states=None):
+        """
+        시퀀스 forward (학습용).
+          lowdim_seq    : [B, L, lowdim_dim]
+          images_seq    : {cam: [B, L, C, H, W]}
+          hidden_states : list of (conv_st, ssm_st) per block, or None
+        반환:
+          actions       : [B, L, future_steps, action_dim]
+          hidden_states : 청크 마지막 프레임의 hidden state (다음 청크로 전달)
+
+        DINOv2 : [B*L] 병렬 처리 (속도)
+        Mamba  : conv_state·ssm_state를 전달하며 순차 처리 (기억 유지)
         """
         B, L, _ = lowdim_seq.shape
 
-        # 1. 멀티-카메라 특징 추출: [B*L, C, H, W] 일괄 처리
+        # ── 1. DINOv2 병렬 특징 추출 [B*L] ───────────────────────────────────
         feats_all = []
         for cam in self.camera_names:
-            img = images_seq[cam]                            # [B, L, C, H, W]
-            img_flat = img.reshape(B * L, *img.shape[2:])   # [B*L, C, H, W]
-            raw_feat = self.shared_backbone(img_flat)        # [B*L, 1024, H_p, W_p]
+            img      = images_seq[cam]                           # [B, L, C, H, W]
+            img_flat = img.reshape(B * L, *img.shape[2:])        # [B*L, C, H, W]
+            raw_feat = self.shared_backbone(img_flat)             # [B*L, 1024, H_p, W_p]
             if self.img_size == (640, 480):
-                feat = self.spatial_adapter(raw_feat)        # [B*L, embed_dim]
+                feat = self.spatial_adapter(raw_feat)
             elif self.img_size == (128, 128):
                 feat = self.spatial_adpater_low(raw_feat)
             feats_all.append(feat)
 
-        cam_feats = torch.cat(feats_all, dim=1)              # [B*L, embed_dim*num_cams]
+        cam_feats = torch.cat(feats_all, dim=1)                  # [B*L, embed_dim*num_cams]
 
         if self.num_cameras > 1:
             cam_feats = self.cross_cam_attn(
                 cam_feats.unsqueeze(1), cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)
             ).squeeze(1)
 
-        # 2. in_proj + cross-modal attention (프레임별 독립)
-        cam_feats_proj = self.in_proj(cam_feats)             # [B*L, d_model]
-        lowdim_flat = lowdim_seq.reshape(B * L, 1, self.lowdim_dim)  # [B*L, 1, 14]
+        # ── 2. in_proj + cross-modal attention [B*L] ─────────────────────────
+        cam_feats_proj = self.in_proj(cam_feats)                  # [B*L, d_model]
+        lowdim_flat    = lowdim_seq.reshape(B * L, 1, self.lowdim_dim)
 
         fused = self.cross_attn(
-            query=cam_feats_proj.unsqueeze(1),               # [B*L, 1, d_model]
+            query=cam_feats_proj.unsqueeze(1),
             key=lowdim_flat,
             value=lowdim_flat
-        ).squeeze(1)                                         # [B*L, d_model]
+        ).squeeze(1)                                              # [B*L, d_model]
 
-        x = fused.reshape(B, L, self.d_model)               # [B, L, d_model]
+        x = fused.reshape(B, L, self.d_model)                    # [B, L, d_model]
 
-        # 3. Mamba 블록 forward 모드: [B, L, D] 병렬 처리
+        # ── 3. Mamba 블록: hidden_state 전달하며 처리 ─────────────────────────
+        if hidden_states is None:
+            hidden_states = self.init_hidden_states(batch_size=B, device=x.device)
+
+        new_hidden_states = []
         residual = None
-        hidden = x
-        for blk in self.blocks:
+        hidden   = x
+
+        for i, blk in enumerate(self.blocks):
+            conv_st, ssm_st = hidden_states[i]
+
             if residual is None:
                 residual = hidden
             else:
                 residual = residual + hidden
 
             hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
-            # forward() -> Triton 병렬 prefix-scan (step()과 달리 L차원 전체를 한번에)
-            y = blk.mixer(hidden_ln)                         # [B, L, d_model]
+
+            # conv_state·ssm_state를 받아 알고리즘적으로 forward
+            y, new_conv_st, new_ssm_st = self._mamba2_block_forward(
+                blk.mixer, hidden_ln, conv_st, ssm_st
+            )
+
             hidden_out = y + residual
 
             if blk.mlp is not None:
-                r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
+                r2         = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
                 hidden_out = blk.mlp(r2) + hidden_out
 
-            hidden = hidden_out
+            new_hidden_states.append((new_conv_st, new_ssm_st))
+            hidden   = hidden_out
             residual = hidden_out
 
-        # 4. 출력 투영
-        action_flat = self.out_proj(hidden)                  # [B, L, future_steps*action_dim]
-        actions = action_flat.view(B, L, self.future_steps, self.action_dim)
-        return actions
+        # ── 4. 출력 투영 ──────────────────────────────────────────────────────
+        action_flat = self.out_proj(hidden)
+        actions     = action_flat.view(B, L, self.future_steps, self.action_dim)
+        return actions, new_hidden_states
 
 # forward一般不使用
     def forward(self, lowdim, images):
